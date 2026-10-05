@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wirelab</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<style>
+:root {
+  --paper: #f4f1ea; --ink: #1d1c1a; --text: #1d1c1a; --muted: #6b665c; --rule: #cfc8b8;
+  --c2s: #b5651d; --s2c: #2f6f73; --alarm: #a3271f; --field: #fbf9f4;
+  --sans: "IBM Plex Sans", sans-serif; --mono: "IBM Plex Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --paper: #191816; --text: #e8e3d8; --muted: #9a948a; --rule: #3a3732;
+          --c2s: #d08a4a; --s2c: #5fa3a6; --alarm: #e0574d; --field: #22211e; }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--paper); color: var(--text); font: 14px/1.45 var(--sans); }
+:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
+.lab { display: grid; grid-template-columns: minmax(0, 1fr) 400px minmax(0, 1fr); height: 100vh; }
+.zone { display: flex; flex-direction: column; min-width: 0; }
+.zone + .zone { border-left: 1px solid var(--rule); }
+.zone-head { padding: 10px 14px 8px; border-bottom: 1px solid var(--rule); }
+.zone-head h2 { margin: 0; font-size: 15px; font-weight: 600; display: flex; gap: 10px; align-items: baseline; }
+.zone-head .addr { font: 13px var(--mono); color: var(--muted); }
+.zone-head .folder { font: 12px var(--mono); color: var(--muted); word-break: break-all; }
+.endpoint { font: 13px var(--mono); margin: 4px 0 2px; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
+.endpoint b { font-weight: 500; }
+.endpoint .st { font: 12px var(--sans); color: var(--muted); }
+.endpoint .st.on { color: var(--text); }
+#client h2 { color: var(--c2s); } #server h2 { color: var(--s2c); }
+.term { flex: 1; min-height: 0; background: var(--ink); padding: 6px 0 0 8px; }
+.zone-foot { display: flex; gap: 10px; align-items: center; padding: 6px 14px; border-top: 1px solid var(--rule); font-size: 12px; color: var(--muted); }
+button { font: 500 13px var(--sans); color: var(--text); background: transparent; border: 1px solid var(--rule); border-radius: 2px; padding: 4px 10px; cursor: pointer; }
+button:hover { border-color: var(--text); }
+input, textarea { font: 13px var(--mono); color: var(--text); background: var(--field); border: 1px solid var(--rule); border-radius: 2px; padding: 3px 6px; }
+#wire { overflow-y: auto; }
+section { padding: 10px 14px; border-bottom: 1px solid var(--rule); }
+section h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
+.meta { font: 12px var(--mono); color: var(--muted); word-break: break-all; }
+.counts { display: grid; grid-template-columns: auto 1fr 1fr; gap: 2px 12px; font: 13px var(--mono); font-variant-numeric: tabular-nums; }
+.counts .h { color: var(--muted); font: 12px var(--sans); }
+.c2s { color: var(--c2s); } .s2c { color: var(--s2c); }
+.netem { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px 8px; margin-top: 4px; }
+.netem label { display: flex; flex-direction: column; font-size: 12px; color: var(--muted); }
+.netem input { width: 100%; margin-top: 2px; }
+.dirblock + .dirblock { margin-top: 12px; }
+.dirblock .row { display: flex; justify-content: space-between; align-items: center; }
+.tc { font: 12px var(--mono); color: var(--muted); margin-top: 4px; word-break: break-all; }
+.err { color: var(--alarm); font-size: 12px; }
+.hint { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
+textarea { width: 100%; height: 54px; resize: vertical; }
+#alarms div { color: var(--alarm); font: 12px var(--mono); margin-top: 3px; }
+#feed { font: 12px/1.5 var(--mono); font-variant-numeric: tabular-nums; }
+#feed .p { display: grid; grid-template-columns: 52px 64px 34px 40px 40px 1fr; gap: 6px; padding-left: 6px; border-left: 2px solid transparent; white-space: nowrap; }
+#feed .p.c2s { border-left-color: var(--c2s); } #feed .p.s2c { border-left-color: var(--s2c); }
+#feed .p > span { overflow: hidden; text-overflow: ellipsis; color: var(--text); }
+#feed .p .d { color: inherit; }
+#feed .note { grid-column: 2 / -1; white-space: normal; color: var(--muted); }
+#feed .p.alarm .note { color: var(--alarm); }
+#feed .gap { color: var(--muted); padding-left: 8px; }
+@media (max-width: 900px) {
+  .lab { grid-template-columns: 1fr; height: auto; }
+  .zone + .zone { border-left: 0; border-top: 1px solid var(--rule); }
+  .term { height: 360px; flex: none; }
+  #wire { overflow: visible; }
+}
+</style>
+</head>
+<body>
+<main class="lab">
+  <div class="zone" id="client">
+    <div class="zone-head">
+      <h2>Client <span class="addr" id="client-ip"></span></h2>
+      <div class="endpoint">connect to <b id="client-connect"></b><span class="st" id="client-status"></span></div>
+      <div class="folder" id="client-folder"></div>
+    </div>
+    <div class="term" id="term-client"></div>
+    <div class="zone-foot"><button data-reconnect="client">Reconnect</button><span id="client-state"></span></div>
+  </div>
+
+  <div class="zone" id="wire">
+    <section>
+      <div class="meta" id="lab-meta"></div>
+      <div class="meta" id="capture-state"></div>
+    </section>
+    <section>
+      <h3>Wire</h3>
+      <div class="counts">
+        <span class="h"></span><span class="h">packets</span><span class="h">IP bytes</span>
+        <span class="c2s">c→s</span><span id="c2s-p">0</span><span id="c2s-b">0</span>
+        <span class="s2c">s→c</span><span id="s2c-p">0</span><span id="s2c-b">0</span>
+      </div>
+      <p class="hint">Captured on the client side: c→s as the client sent it, s→c after impairments.</p>
+    </section>
+    <section id="netem"></section>
+    <section>
+      <h3>Secrets in the clear</h3>
+      <textarea id="needles" placeholder="label = value, one per line&#10;uuid = 01234567-89ab-cdef-0123-456789abcdef"></textarea>
+      <div class="row" style="display:flex;gap:10px;align-items:center;margin-top:6px">
+        <button id="needles-apply">Watch</button><span class="hint" id="needles-state" style="margin:0"></span>
+      </div>
+      <p class="hint">Matched as text; UUIDs and hex also as raw bytes.</p>
+      <div id="alarms"></div>
+    </section>
+    <section>
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <h3 style="margin:0">Packets</h3>
+        <button id="feed-pause">Pause</button>
+      </div>
+      <div id="feed"></div>
+    </section>
+  </div>
+
+  <div class="zone" id="server">
+    <div class="zone-head">
+      <h2>Server <span class="addr" id="server-ip"></span></h2>
+      <div class="endpoint">listen on <b id="server-listen"></b><span class="st" id="server-status"></span></div>
+      <div class="folder" id="server-folder"></div>
+    </div>
+    <div class="term" id="term-server"></div>
+    <div class="zone-foot"><button data-reconnect="server">Reconnect</button><span id="server-state"></span></div>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+<script>
+const token = new URLSearchParams(location.search).get("t") || "";
+const api = (path, body) => fetch(path, {
+  method: body ? "POST" : "GET",
+  headers: { "x-wirelab-token": token, "content-type": "application/json" },
+  body: body ? JSON.stringify(body) : undefined,
+}).then(async r => { if (!r.ok) throw new Error(await r.text()); return r.json(); });
+const wsUrl = path => `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${path}${path.includes("?") ? "&" : "?"}t=${token}`;
+const $ = id => document.getElementById(id);
+const fmt = n => n.toLocaleString("en-US");
+
+// Consoles. The size is fixed when a console connects: the remote terminal
+// gets it once, so after resizing the window use "Reconnect".
+const consoles = {};
+function openConsole(zone) {
+  const old = consoles[zone];
+  if (old) { old.ws.close(); old.term.dispose(); }
+  const term = new Terminal({ fontFamily: '"IBM Plex Mono", monospace', fontSize: 13, cursorBlink: false,
+    theme: { background: "#1d1c1a", foreground: "#e8e3d8" } });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  const el = $("term-" + zone);
+  el.innerHTML = "";
+  term.open(el);
+  fit.fit();
+  const ws = new WebSocket(wsUrl(`/ws/term/${zone}?cols=${term.cols}&rows=${term.rows}`));
+  ws.binaryType = "arraybuffer";
+  const state = $(zone + "-state");
+  ws.onopen = () => { state.textContent = `${term.cols}×${term.rows}`; term.focus(); };
+  ws.onmessage = e => term.write(typeof e.data === "string" ? e.data : new Uint8Array(e.data));
+  ws.onclose = () => { state.textContent = "disconnected"; };
+  term.onData(d => { if (ws.readyState === 1) ws.send(d); });
+  consoles[zone] = { term, ws };
+}
+document.querySelectorAll("[data-reconnect]").forEach(b => b.onclick = () => openConsole(b.dataset.reconnect));
+
+// Wire controls.
+const fields = [["delay_ms", "delay, ms"], ["jitter_ms", "jitter, ms"], ["loss_pct", "loss, %"],
+                ["duplicate_pct", "duplicate, %"], ["corrupt_pct", "corrupt, %"], ["rate_kbit", "rate, kbit/s"]];
+function netemBlock(dir, title) {
+  const div = document.createElement("div");
+  div.className = "dirblock";
+  div.innerHTML = `<div class="row"><h3 class="${dir}" style="margin:0">${title}</h3><button data-apply="${dir}">Apply</button></div>
+    <div class="netem">${fields.map(([k, l]) => `<label>${l}<input type="number" min="0" step="any" value="0" id="${dir}-${k}"></label>`).join("")}</div>
+    <div class="tc" id="${dir}-tc"></div><div class="err" id="${dir}-err"></div>`;
+  return div;
+}
+const netem = $("netem");
+netem.innerHTML = "<h3>Impairments (netem)</h3>";
+netem.append(netemBlock("c2s", "c→s"), netemBlock("s2c", "s→c"));
+const hint = document.createElement("p");
+hint.className = "hint";
+hint.textContent = "All zeros remove the impairments. Jitter in netem reorders packets.";
+netem.append(hint);
+function showQdisc(q) { for (const d of ["c2s", "s2c"]) $(d + "-tc").textContent = q[d] || ""; }
+netem.querySelectorAll("[data-apply]").forEach(b => b.onclick = async () => {
+  const dir = b.dataset.apply, body = { dir };
+  for (const [k] of fields) body[k] = Number($(`${dir}-${k}`).value) || 0;
+  $(dir + "-err").textContent = "";
+  try { showQdisc((await api("/api/netem", body)).qdisc); }
+  catch (e) { $(dir + "-err").textContent = e.message; }
+});
+
+$("needles-apply").onclick = async () => {
+  const list = $("needles").value.split("\n").map(l => l.trim()).filter(Boolean).map(l => {
+    const i = l.indexOf("=");
+    return i > 0 ? { label: l.slice(0, i).trim(), text: l.slice(i + 1).trim() } : { label: l.slice(0, 12), text: l };
+  });
+  try { const r = await api("/api/needles", list); $("needles-state").textContent = `watching ${r.watching}`; }
+  catch (e) { $("needles-state").textContent = e.message; }
+};
+
+// Packet feed.
+const feed = $("feed");
+let paused = false;
+$("feed-pause").onclick = e => { paused = !paused; e.target.textContent = paused ? "Resume" : "Pause"; };
+function rowEl(r) {
+  const d = document.createElement("div");
+  d.className = `p ${r.dir}${r.alarm ? " alarm" : ""}`;
+  const cells = [r.n, r.t_ms.toFixed(1), r.dir === "c2s" ? "c→s" : "s→c", r.len, r.payload, r.entropy ?? ""];
+  d.innerHTML = cells.map((c, i) => `<span${i === 2 ? ' class="d"' : ""}></span>`).join("");
+  [...d.children].forEach((s, i) => s.textContent = cells[i]);
+  d.title = `${r.proto} ${r.sport} → ${r.dport}, IP bytes ${r.len}, payload ${r.payload}` + (r.entropy != null ? `, entropy ${r.entropy} bits/byte` : "");
+  if (r.note) { const n = document.createElement("span"); n.className = "note"; n.textContent = r.note; d.append(n); }
+  return d;
+}
+function addRows(rows, dropped) {
+  if (paused && !rows.some(r => r.alarm)) return;
+  const frag = document.createDocumentFragment();
+  for (const r of rows) frag.append(rowEl(r));
+  if (dropped) { const g = document.createElement("div"); g.className = "gap"; g.textContent = `${fmt(dropped)} more packets without notes not shown`; frag.append(g); }
+  feed.prepend(frag);
+  while (feed.childElementCount > 400) feed.lastElementChild.remove();
+}
+function showCounts(c) {
+  $("c2s-p").textContent = fmt(c[0].packets); $("c2s-b").textContent = fmt(c[0].ip_bytes);
+  $("s2c-p").textContent = fmt(c[1].packets); $("s2c-b").textContent = fmt(c[1].ip_bytes);
+}
+function wireStream() {
+  const ws = new WebSocket(wsUrl("/ws/wire"));
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    showCounts(m.counts);
+    $("capture-state").textContent = "capture: " + m.capture;
+    if (m.type === "snapshot") {
+      feed.innerHTML = "";
+      addRows(m.rows.slice().reverse(), 0);
+      $("alarms").innerHTML = "";
+      for (const a of m.alarms) { const d = document.createElement("div"); d.textContent = a; $("alarms").append(d); }
+      $("needles").value = m.needles.map(n => `${n.label} = ${n.text}`).join("\n");
+    } else {
+      addRows(m.rows.slice().reverse(), m.dropped_rows);
+      for (const r of m.rows.filter(r => r.alarm)) { const d = document.createElement("div"); d.textContent = r.note; $("alarms").prepend(d); }
+    }
+  };
+  ws.onclose = () => { $("capture-state").textContent = "lost the panel connection, retrying in 2 s"; setTimeout(wireStream, 2000); };
+}
+
+api("/api/lab").then(l => {
+  $("client-ip").textContent = l.client.ip;
+  $("server-ip").textContent = l.server.ip;
+  $("client-folder").textContent = `/lab = ${l.client.folder}`;
+  $("server-folder").textContent = `/lab = ${l.server.folder} · target ${l.server.target}`;
+  $("client-connect").textContent = l.client.connect;
+  $("server-listen").textContent = l.server.listen;
+  $("lab-meta").textContent = `lab ${l.id} · ${l.base} · env WL_SERVER_ADDR, WL_SERVER_PORT · session ${l.session}`;
+  showQdisc(l.qdisc);
+  openConsole("client");
+  openConsole("server");
+  wireStream();
+  pollStatus(l.port);
+}).catch(e => { document.body.textContent = "The panel did not answer: " + e.message; });
+
+// Whether the server listens on the lab port and the client is connected,
+// read from the containers' socket tables every 2 s.
+async function pollStatus(port) {
+  const set = (id, text, on) => { const el = $(id); el.textContent = text; el.classList.toggle("on", on); };
+  try {
+    const s = await api("/api/status");
+    if (s.listening_error) set("server-status", "status unavailable: " + s.listening_error, false);
+    else if (s.listening.length) set("server-status", "listening (" + s.listening.join(", ") + ")", true);
+    else set("server-status", `nothing listens on ${port} yet`, false);
+    if (s.client_error) set("client-status", "status unavailable: " + s.client_error, false);
+    else if (s.client_connections) set("client-status", `${s.client_connections} connection${s.client_connections > 1 ? "s" : ""} open`, true);
+    else set("client-status", "no connection", false);
+  } catch (e) { set("server-status", "status unavailable: " + e.message, false); }
+  setTimeout(() => pollStatus(port), 2000);
+}
+</script>
+</body>
+</html>

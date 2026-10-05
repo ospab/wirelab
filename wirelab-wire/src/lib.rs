@@ -1,6 +1,7 @@
 //! The wire zone: the link between the endpoints, and what an observer on it
 //! can see.
 
+pub mod capture;
 pub mod link;
 pub mod observe;
 pub mod pcap;

@@ -31,6 +31,38 @@ enum Cmd {
     },
     /// List the protocol adapters this build has.
     Protocols,
+    /// Containers left running for you to work in: client, wire, server.
+    Lab {
+        #[command(subcommand)]
+        cmd: LabCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum LabCmd {
+    /// Build the images and start the lab.
+    Up {
+        #[arg(long, default_value = "default")]
+        id: String,
+        /// Image base for client and server: alpine (musl) or debian (glibc).
+        #[arg(long, default_value = "alpine")]
+        base: String,
+        /// Port the server listens on and the client connects to.
+        #[arg(long, default_value_t = wirelab_lab::lab::DEFAULT_PORT)]
+        port: u16,
+    },
+    /// Serve the panel for a running lab on 127.0.0.1.
+    Panel {
+        #[arg(long, default_value = "default")]
+        id: String,
+        #[arg(long, default_value_t = 7077)]
+        port: u16,
+    },
+    /// Stop and remove the lab's containers. Folders and sessions stay.
+    Down {
+        #[arg(long, default_value = "default")]
+        id: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -68,6 +100,24 @@ fn real_main() -> Result<ExitCode> {
         Cmd::Protocols => {
             for (name, what) in PROTOCOLS {
                 println!("{name:<10} {what}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Lab { cmd } => {
+            let root = wirelab_lab::lab::find_root()?;
+            let docker = wirelab_lab::Docker::detect();
+            match cmd {
+                LabCmd::Up { id, base, port } => {
+                    let info = wirelab_lab::lab::up(&docker, &root, &id, wirelab_lab::Base::parse(&base)?, port)?;
+                    println!("{}", info.summary());
+                }
+                LabCmd::Panel { id, port } => {
+                    tokio::runtime::Runtime::new()?.block_on(wirelab_lab::panel::serve(root, id, port))?;
+                }
+                LabCmd::Down { id } => {
+                    wirelab_lab::lab::down(&docker, &root, &id)?;
+                    println!("lab {id} stopped; its folders and sessions are kept");
+                }
             }
             Ok(ExitCode::SUCCESS)
         }

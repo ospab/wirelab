@@ -1,0 +1,6 @@
+FROM debian:stable-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash curl nginx-light iproute2 ethtool procps less ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY node.sh /node.sh
+ENTRYPOINT ["/bin/sh", "/node.sh"]

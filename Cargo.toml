@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["wirelab-core", "wirelab-wire", "wirelab-sim", "wirelab-ostp", "wirelab-cli"]
+members = ["wirelab-core", "wirelab-wire", "wirelab-sim", "wirelab-ostp", "wirelab-lab", "wirelab-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ wirelab-core = { path = "wirelab-core" }
 wirelab-wire = { path = "wirelab-wire" }
 wirelab-sim = { path = "wirelab-sim" }
 wirelab-ostp = { path = "wirelab-ostp" }
+wirelab-lab = { path = "wirelab-lab" }
 # The OSTP adapter drives the real protocol core from the sibling checkout:
 # a reimplementation would only test itself.
 ostp-core = { path = "../ostp/ostp-core" }
@@ -23,3 +24,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.5"
 clap = { version = "4", features = ["derive"] }
+# 0.7 rather than 0.8: its WebSocket stack (tokio-tungstenite 0.24) is what
+# the offline cache holds.
+axum = { version = "=0.7.9", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"

@@ -1,4 +1,5 @@
-/target/
-/runs/
-/tools/
+/containers/wire/bin/
 /lab/
+/runs/
+/target/
+/tools/

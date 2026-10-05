@@ -9,6 +9,9 @@ use std::net::Ipv4Addr;
 pub enum Transport {
     Tcp,
     Udp,
+    /// ICMP type and code; the payload is the ICMP body after the 4-byte
+    /// header, so for errors it starts with the quoted original packet.
+    Icmp(u8, u8),
 }
 
 #[derive(Debug, Clone)]
@@ -155,10 +158,28 @@ fn parse_ipv4(ip: &[u8], t_us: u64) -> Option<Packet> {
             let doff = (*l4.get(12)? >> 4) as usize * 4;
             (Transport::Tcp, u16::from_be_bytes([l4[0], l4[1]]), u16::from_be_bytes([l4[2], l4[3]]), l4.get(doff..)?)
         }
+        1 => (Transport::Icmp(*l4.first()?, *l4.get(1)?), 0, 0, l4.get(8..)?),
         17 => (Transport::Udp, u16::from_be_bytes([*l4.first()?, *l4.get(1)?]), u16::from_be_bytes([*l4.get(2)?, *l4.get(3)?]), l4.get(8..)?),
         _ => return None,
     };
     Some(Packet { t_us, src, dst, transport, sport, dport, ip_len, payload: payload.to_vec() })
+}
+
+/// An ICMP destination-unreachable quotes the packet it refers to. Returns
+/// `(protocol, destination, destination port)` of that original packet.
+pub fn icmp_quoted_target(body: &[u8]) -> Option<(&'static str, Ipv4Addr, u16)> {
+    if body.len() < 20 || body[0] >> 4 != 4 {
+        return None;
+    }
+    let ihl = (body[0] & 0x0f) as usize * 4;
+    let proto = match body[9] {
+        6 => "tcp",
+        17 => "udp",
+        _ => return None,
+    };
+    let dst = Ipv4Addr::new(body[16], body[17], body[18], body[19]);
+    let l4 = body.get(ihl..ihl + 4)?;
+    Some((proto, dst, u16::from_be_bytes([l4[2], l4[3]])))
 }
 
 /// What a TLS ClientHello reveals in the clear.

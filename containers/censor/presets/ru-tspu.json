@@ -1,0 +1,82 @@
+{
+  "name": "Russia (TSPU)",
+  "as_of": "2025-06",
+  "notes": "Documented TSPU behaviours only. Domain and address lists are examples: the real registries are not public, fill in what you want to test. Not modelled: SNI-dependent QUIC blocking (Heitmann, FOCI 2026, observed 2022-2023, needs QUIC Initial decryption); SNI-III throttling (replaced by SNI-I on 2022-03-04); whether TSPU reassembles a ClientHello split across TCP segments (not established in the sources used).",
+  "rules": [
+    {
+      "id": "ru-sni-drop-all",
+      "name": "SNI-IV: drop both directions, including the ClientHello",
+      "kind": "sni",
+      "action": "drop_both",
+      "drop_trigger": true,
+      "block_seconds": 40,
+      "domains": ["facebook.com", "instagram.com", "twitter.com"],
+      "source": "Xue et al., TSPU: Russia's Decentralized Censorship System, IMC 2022, section 5.2 (SNI-IV) and Table 2 (40 s). https://ensa.fi/papers/tspu-imc22.pdf",
+      "disabled": true
+    },
+    {
+      "id": "ru-sni-rst",
+      "name": "SNI-I: server-to-client packets truncated to RST/ACK",
+      "kind": "sni",
+      "action": "rst_s2c",
+      "block_seconds": 75,
+      "domains": ["facebook.com", "instagram.com", "twitter.com", "blocked.example"],
+      "source": "Xue et al., IMC 2022, section 5.2 (SNI-I) and Table 2 (75 s). https://ensa.fi/papers/tspu-imc22.pdf"
+    },
+    {
+      "id": "ru-sni-drop-after",
+      "name": "SNI-II: 5 to 8 more packets, then drop both directions",
+      "kind": "sni",
+      "action": "drop_both",
+      "after_packets": 5,
+      "block_seconds": 420,
+      "domains": ["nordvpn.com", "play.google.com", "news.google.com"],
+      "source": "Xue et al., IMC 2022, section 5.2 (SNI-II, 'five to eight packets') and Table 2 (420 s). https://ensa.fi/papers/tspu-imc22.pdf"
+    },
+    {
+      "id": "ru-quic-v1",
+      "name": "QUIC v1 to UDP 443 with at least 1001 payload bytes: drop the flow",
+      "kind": "quic_v1",
+      "action": "drop_both",
+      "port": 443,
+      "min_payload": 1001,
+      "block_seconds": 420,
+      "source": "Xue et al., IMC 2022, section 5.2 (QUIC blocking, version 0x00000001, >= 1001 bytes, from the local side) and Table 2 (420 s). https://ensa.fi/papers/tspu-imc22.pdf"
+    },
+    {
+      "id": "ru-ip",
+      "name": "Blocked server addresses: packets dropped",
+      "kind": "ip",
+      "action": "drop_both",
+      "cidrs": [],
+      "source": "Xue et al., IMC 2022, section 5.2 (IP-based blocking). https://ensa.fi/papers/tspu-imc22.pdf"
+    },
+    {
+      "id": "ru-wireguard",
+      "name": "WireGuard: cut after the handshake and two data packets",
+      "kind": "wireguard",
+      "action": "drop_both",
+      "max_data_packets": 2,
+      "source": "net4people/bbs #274, 2023-08-07: 'more than two data packets (message_type = 4), after a successful handshake'. https://github.com/net4people/bbs/issues/274"
+    },
+    {
+      "id": "ru-openvpn",
+      "name": "OpenVPN: cut after the handshake and 15 data packets",
+      "kind": "openvpn",
+      "action": "drop_both",
+      "max_data_packets": 15,
+      "source": "net4people/bbs #274, 2023-08-07: 'more than 15 packets with data (P_DATA), after a successful handshake'. https://github.com/net4people/bbs/issues/274"
+    },
+    {
+      "id": "ru-freeze-16k",
+      "name": "Foreign data-centre servers: freeze after about 25 packets",
+      "kind": "freeze",
+      "action": "drop_s2c",
+      "after_packets": 25,
+      "cidrs": ["10.77.2.0/24"],
+      "exempt_ssh": true,
+      "allow_sni": [],
+      "source": "net4people/bbs #490 (2025-06-27, Update 5): frozen 'after 25 packets have been sent in either direction', tcp and udp, ~16 KB; no RST; SSH unaffected; whitelisted SNI pass. The lab server stands for a VPS in a foreign data centre; remove its network from cidrs to model a domestic server. https://github.com/net4people/bbs/issues/490"
+    }
+  ]
+}

@@ -56,9 +56,14 @@ pub struct LabInfo {
     /// Labs started before this field existed were told nothing, hence 443.
     #[serde(default = "default_port")]
     pub server_port: u16,
+    /// The wire routes through wl-censor rather than the kernel. Set when
+    /// the censor binary was built at `lab up` time.
+    #[serde(default)]
+    pub censor: bool,
 }
 
 pub const DEFAULT_PORT: u16 = 443;
+pub const CENSOR_BIN: &str = "containers/wire/bin/wl-censor";
 
 fn default_port() -> u16 {
     DEFAULT_PORT
@@ -149,7 +154,11 @@ pub fn up(docker: &Docker, root: &Path, id: &str, base: Base, server_port: u16) 
         session: session.clone(),
         started_unix,
         server_port,
+        censor: root.join(CENSOR_BIN).is_file(),
     };
+    if !info.censor {
+        println!("note: {} is not built, so the wire forwards in the kernel and has no censor", CENSOR_BIN);
+    }
 
     let compose = dir.join("compose.yml");
     fs::write(&compose, compose_file(&info, &node_image))?;
@@ -194,10 +203,13 @@ services:
     image: wl-wire
     container_name: {wire}
     cap_add: [NET_ADMIN, NET_RAW]
-    sysctls: {{net.ipv4.ip_forward: "1"}}
-    environment: {{WIRE_CAPTURE: "0"}}
+    # The script and the censor come from the checkout rather than the image,
+    # so changing them needs no rebuild.
+    entrypoint: ["/bin/sh", "/wl-wire/entrypoint.sh"]
+    sysctls: {{net.ipv4.ip_forward: "{forward}"}}
+    environment: {{WIRE_CAPTURE: "0", WIRE_CENSOR: "{censor}"}}
     networks: {{net_c: {{ipv4_address: {wc}}}, net_s: {{ipv4_address: {ws}}}}}
-    volumes: ["./sessions/{session}:/out"]
+    volumes: ["./sessions/{session}:/out", "../../containers/wire:/wl-wire:ro"]
   client:
     image: {node_image}
     container_name: {client}
@@ -227,5 +239,7 @@ services:
         cip = CLIENT_IP,
         sip = SERVER_IP,
         port = info.server_port,
+        forward = if info.censor { 0 } else { 1 },
+        censor = if info.censor { 1 } else { 0 },
     )
 }

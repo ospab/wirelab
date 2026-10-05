@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
 use wirelab_wire::byte_entropy;
-use wirelab_wire::capture::{find_all, parse_client_hello, PcapStream, Transport};
+use wirelab_wire::capture::{find_all, icmp_quoted_target, parse_client_hello, PcapStream, Transport};
 
 const INDEX: &str = include_str!("panel.html");
 const RECENT_ROWS: usize = 400;
@@ -32,6 +32,8 @@ const ROWS_PER_TICK: usize = 300;
 
 struct Panel {
     info: LabInfo,
+    /// Censor presets shipped in the checkout (`containers/censor/presets`).
+    presets: std::path::PathBuf,
     docker: Docker,
     token: String,
     origins: [String; 2],
@@ -82,6 +84,8 @@ struct WireState {
     needles: Vec<(Needle, Vec<Vec<u8>>)>,
     alarms: Vec<String>,
     capture: String,
+    censor_recent: VecDeque<serde_json::Value>,
+    censor_pending: Vec<serde_json::Value>,
 }
 
 fn now_ms() -> u128 {
@@ -105,6 +109,7 @@ pub async fn serve(root: std::path::PathBuf, id: String, port: u16) -> Result<()
         origins: [format!("http://127.0.0.1:{port}"), format!("http://localhost:{port}")],
         if_to_server: if_s.to_string(),
         if_to_client: if_c.to_string(),
+        presets: root.join("containers/censor/presets"),
         info,
         docker,
         token,
@@ -113,6 +118,9 @@ pub async fn serve(root: std::path::PathBuf, id: String, port: u16) -> Result<()
     });
 
     tokio::spawn(capture(panel.clone()));
+    if panel.info.censor {
+        tokio::spawn(censor_tail(panel.clone()));
+    }
     tokio::spawn(ticker(panel.clone()));
 
     let app = Router::new()
@@ -121,6 +129,7 @@ pub async fn serve(root: std::path::PathBuf, id: String, port: u16) -> Result<()
         .route("/api/status", get(api_status))
         .route("/api/netem", post(api_netem))
         .route("/api/needles", post(api_needles))
+        .route("/api/censor", get(api_censor_get).post(api_censor_set))
         .route("/ws/wire", get(ws_wire))
         .route("/ws/term/:zone", get(ws_term))
         .with_state(panel.clone());
@@ -204,17 +213,25 @@ async fn api_status(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<String,
     let status = tokio::task::spawn_blocking(move || {
         let port = p2.info.server_port;
         let suffix = format!(":{port}");
-        let listening = p2.docker.run(&["exec", &p2.info.server, "ss", "-Hltn"]).map(|out| {
+        // Columns of `ss -H -tun`: Netid State Recv-Q Send-Q Local Peer.
+        let listening = p2.docker.run(&["exec", &p2.info.server, "ss", "-Hltun"]).map(|out| {
             out.lines()
-                .filter_map(|l| l.split_whitespace().nth(3))
-                .filter(|local| local.ends_with(&suffix))
-                .map(String::from)
+                .filter_map(|l| {
+                    let f: Vec<&str> = l.split_whitespace().collect();
+                    (f.len() > 4 && f[4].ends_with(&suffix)).then(|| format!("{} {}", f[0], f[4]))
+                })
                 .collect::<Vec<_>>()
         });
+        // A UDP socket counts only when connected to the server; an
+        // unconnected one sending with sendto() has no peer to attribute.
         let peer = format!("{}:{port}", lab::SERVER_IP);
-        let connections = p2.docker.run(&["exec", &p2.info.client, "ss", "-Htn", "state", "established"]).map(|out| {
-            // With a state filter ss drops the State column: Recv-Q Send-Q Local Peer.
-            out.lines().filter(|l| l.split_whitespace().nth(3) == Some(peer.as_str())).count()
+        let connections = p2.docker.run(&["exec", &p2.info.client, "ss", "-Htun"]).map(|out| {
+            out.lines()
+                .filter_map(|l| {
+                    let f: Vec<&str> = l.split_whitespace().collect();
+                    (f.len() > 5 && f[5] == peer && f[1] == "ESTAB").then(|| f[0].to_string())
+                })
+                .collect::<Vec<_>>()
         });
         serde_json::json!({
             "listening": listening.as_ref().ok(),
@@ -414,6 +431,13 @@ fn observe(w: &mut WireState, pkt: wirelab_wire::capture::Packet) {
     c.payload_bytes += pkt.payload.len() as u64;
 
     let mut note = None;
+    if let Transport::Icmp(ty, code) = pkt.transport {
+        note = Some(match (ty, code, icmp_quoted_target(&pkt.payload)) {
+            (3, 3, Some((proto, dst, port))) => format!("ICMP port unreachable: nothing listens on {proto} {dst}:{port}"),
+            (3, _, Some((proto, dst, port))) => format!("ICMP destination unreachable (code {code}) for {proto} {dst}:{port}"),
+            _ => format!("ICMP type {ty} code {code}"),
+        });
+    }
     if pkt.transport == Transport::Tcp && !pkt.payload.is_empty() {
         if let Some(h) = parse_client_hello(&pkt.payload) {
             note = Some(format!(
@@ -441,7 +465,11 @@ fn observe(w: &mut WireState, pkt: wirelab_wire::capture::Packet) {
         n: w.seen,
         t_ms: (pkt.t_us - first) as f64 / 1000.0,
         dir,
-        proto: if pkt.transport == Transport::Tcp { "tcp" } else { "udp" },
+        proto: match pkt.transport {
+            Transport::Tcp => "tcp",
+            Transport::Udp => "udp",
+            Transport::Icmp(..) => "icmp",
+        },
         sport: pkt.sport,
         dport: pkt.dport,
         len: pkt.ip_len,
@@ -471,13 +499,124 @@ async fn ticker(p: Arc<Panel>) {
             let mut w = p.wire.lock().unwrap();
             let rows = std::mem::take(&mut w.pending);
             let dropped = std::mem::take(&mut w.dropped_rows);
+            let censor = std::mem::take(&mut w.censor_pending);
             serde_json::json!({
                 "type": "tick", "counts": w.counts, "rows": rows, "dropped_rows": dropped,
-                "capture": w.capture, "alarms": w.alarms.len(),
+                "capture": w.capture, "alarms": w.alarms.len(), "censor": censor,
             })
         };
         let _ = p.events.send(msg.to_string());
     }
+}
+
+const ACTIVE_PRESET: &str = "censor-preset.json";
+
+/// Follows the censor's decision log in the session folder. The censor
+/// writes it from inside the wire container through the bind mount.
+async fn censor_tail(p: Arc<Panel>) {
+    let path = p.info.session.join("censor.jsonl");
+    let mut offset = 0u64;
+    let mut partial = String::new();
+    let mut iv = tokio::time::interval(Duration::from_millis(300));
+    loop {
+        iv.tick().await;
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        if (bytes.len() as u64) < offset {
+            offset = 0; // the file was replaced
+        }
+        if bytes.len() as u64 == offset {
+            continue;
+        }
+        partial.push_str(&String::from_utf8_lossy(&bytes[offset as usize..]));
+        offset = bytes.len() as u64;
+        let mut w = p.wire.lock().unwrap();
+        while let Some(nl) = partial.find('\n') {
+            let line: String = partial.drain(..=nl).collect();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                w.censor_recent.push_back(v.clone());
+                if w.censor_recent.len() > 200 {
+                    w.censor_recent.pop_front();
+                }
+                w.censor_pending.push(v);
+            }
+        }
+    }
+}
+
+fn read_presets(dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    let mut files: Vec<_> = entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "json")).collect();
+    files.sort();
+    for f in files {
+        let file = f.file_name().unwrap().to_string_lossy().into_owned();
+        match std::fs::read(&f).map_err(|e| e.to_string()).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).map_err(|e| e.to_string())) {
+            Ok(mut v) => {
+                v["file"] = serde_json::Value::String(file);
+                out.push(v);
+            }
+            Err(e) => out.push(serde_json::json!({ "file": file, "error": e })),
+        }
+    }
+    out
+}
+
+async fn api_censor_get(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<String, String>>, h: HeaderMap) -> Response {
+    if !p.authorized(&q, &h) {
+        return deny();
+    }
+    let active = std::fs::read(p.info.session.join(ACTIVE_PRESET)).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    Json(serde_json::json!({
+        "available": p.info.censor,
+        "presets": read_presets(&p.presets),
+        "active": active,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct CensorReq {
+    /// Preset file name, or none to turn the censor off.
+    file: Option<String>,
+    /// Rule ids to switch off in this session.
+    #[serde(default)]
+    disabled: Vec<String>,
+}
+
+async fn api_censor_set(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<String, String>>, h: HeaderMap, Json(r): Json<CensorReq>) -> Response {
+    if !p.authorized(&q, &h) {
+        return deny();
+    }
+    if !p.info.censor {
+        return (StatusCode::CONFLICT, "this lab was started without the censor; build wl-censor, then lab down and lab up").into_response();
+    }
+    let target = p.info.session.join(ACTIVE_PRESET);
+    let Some(file) = r.file else {
+        let _ = std::fs::remove_file(&target);
+        p.session_append("wire-changes.log", "censor: off");
+        return Json(serde_json::json!({ "active": null })).into_response();
+    };
+    if file.contains(['/', '\\']) || !file.ends_with(".json") {
+        return (StatusCode::BAD_REQUEST, "preset must be a file name from containers/censor/presets").into_response();
+    }
+    let mut preset: serde_json::Value = match std::fs::read(p.presets.join(&file)).map_err(|e| e.to_string()).and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string())) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("{file}: {e}")).into_response(),
+    };
+    if let Some(rules) = preset["rules"].as_array_mut() {
+        for rule in rules {
+            let id = rule["id"].as_str().unwrap_or_default().to_string();
+            rule["disabled"] = serde_json::Value::Bool(r.disabled.contains(&id));
+        }
+    }
+    // Written whole and renamed, so the censor never reads half a file.
+    let tmp = p.info.session.join("censor-preset.json.tmp");
+    let write = std::fs::write(&tmp, serde_json::to_vec_pretty(&preset).unwrap()).and_then(|_| std::fs::rename(&tmp, &target));
+    if let Err(e) = write {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    p.session_append("wire-changes.log", &format!("censor: {file}, rules off: {}", if r.disabled.is_empty() { "none".into() } else { r.disabled.join(",") }));
+    Json(serde_json::json!({ "active": preset })).into_response()
 }
 
 async fn ws_wire(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<String, String>>, h: HeaderMap, ws: WebSocketUpgrade) -> Response {
@@ -490,6 +629,7 @@ async fn ws_wire(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<String, St
             serde_json::json!({
                 "type": "snapshot", "counts": w.counts, "rows": w.recent, "capture": w.capture,
                 "alarms": w.alarms, "needles": w.needles.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                "censor": w.censor_recent,
             })
         };
         if socket.send(Message::Text(snapshot.to_string())).await.is_err() {

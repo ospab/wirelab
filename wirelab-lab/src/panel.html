@@ -56,6 +56,17 @@ section h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
 .hint { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
 textarea { width: 100%; height: 54px; resize: vertical; }
 #alarms div { color: var(--alarm); font: 12px var(--mono); margin-top: 3px; }
+select { font: 13px var(--sans); color: var(--text); background: var(--field); border: 1px solid var(--rule); border-radius: 2px; padding: 3px 6px; }
+.rules { margin: 8px 0 0; padding: 0; list-style: none; }
+.rules li { display: grid; grid-template-columns: 18px 1fr; gap: 2px 6px; padding: 4px 0; border-top: 1px solid var(--rule); font-size: 13px; }
+.rules li:first-child { border-top: 0; }
+.rules .src { grid-column: 2; font-size: 12px; color: var(--muted); }
+.rules .src a { color: var(--muted); }
+#censor-log { margin-top: 8px; font: 12px/1.5 var(--mono); max-height: 220px; overflow-y: auto; }
+#censor-log div { padding: 2px 0 2px 6px; border-left: 2px solid var(--rule); margin-top: 2px; }
+#censor-log .hit { border-left-color: var(--alarm); }
+#censor-log .hit .what { color: var(--alarm); }
+#censor-log .meta { color: var(--muted); }
 #feed { font: 12px/1.5 var(--mono); font-variant-numeric: tabular-nums; }
 #feed .p { display: grid; grid-template-columns: 52px 64px 34px 40px 40px 1fr; gap: 6px; padding-left: 6px; border-left: 2px solid transparent; white-space: nowrap; }
 #feed .p.c2s { border-left-color: var(--c2s); } #feed .p.s2c { border-left-color: var(--s2c); }
@@ -97,6 +108,17 @@ textarea { width: 100%; height: 54px; resize: vertical; }
         <span class="s2c">s→c</span><span id="s2c-p">0</span><span id="s2c-b">0</span>
       </div>
       <p class="hint">Captured on the client side: c→s as the client sent it, s→c after impairments.</p>
+    </section>
+    <section id="censor">
+      <h3>Censor</h3>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="censor-preset" aria-label="Censor preset"><option value="">Off</option></select>
+        <button id="censor-apply">Apply</button>
+      </div>
+      <div class="err" id="censor-err"></div>
+      <p class="hint" id="censor-notes"></p>
+      <ul class="rules" id="censor-rules"></ul>
+      <div id="censor-log"></div>
     </section>
     <section id="netem"></section>
     <section>
@@ -202,6 +224,83 @@ $("needles-apply").onclick = async () => {
   catch (e) { $("needles-state").textContent = e.message; }
 };
 
+// Censor: presets come from containers/censor/presets; every rule shows the
+// source it reproduces, and decisions arrive from the censor's own log.
+let presets = [];
+function sourceLinks(src) {
+  const frag = document.createDocumentFragment();
+  const parts = (src || "").split(/(https?:\/\/\S+)/);
+  for (const part of parts) {
+    if (/^https?:\/\//.test(part)) {
+      const a = document.createElement("a");
+      a.href = part; a.target = "_blank"; a.rel = "noopener noreferrer";
+      a.textContent = new URL(part).hostname;
+      frag.append(a);
+    } else frag.append(document.createTextNode(part));
+  }
+  return frag;
+}
+function showRules(preset, disabled) {
+  const ul = $("censor-rules");
+  ul.innerHTML = "";
+  $("censor-notes").textContent = preset ? `${preset.name}, as of ${preset.as_of}. ${preset.notes || ""}` : "Off: traffic passes untouched.";
+  if (!preset) return;
+  for (const r of preset.rules) {
+    const li = document.createElement("li");
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.dataset.rule = r.id; cb.checked = !(disabled ? disabled.includes(r.id) : r.disabled);
+    cb.id = "rule-" + r.id;
+    const label = document.createElement("label");
+    label.htmlFor = cb.id; label.textContent = r.name;
+    const src = document.createElement("span");
+    src.className = "src"; src.append(sourceLinks(r.source));
+    li.append(cb, label, src);
+    ul.append(li);
+  }
+}
+async function loadCensor() {
+  const c = await api("/api/censor");
+  if (!c.available) {
+    $("censor-err").textContent = "This lab runs without the censor. Build wl-censor, then lab down and lab up.";
+    $("censor-apply").disabled = true;
+  }
+  presets = c.presets.filter(p => !p.error);
+  const sel = $("censor-preset");
+  for (const p of presets) { const o = document.createElement("option"); o.value = p.file; o.textContent = p.name; sel.append(o); }
+  const active = c.active && presets.find(p => p.name === c.active.name);
+  sel.value = active ? active.file : "";
+  showRules(active ? presets.find(p => p.file === sel.value) : null,
+            c.active ? c.active.rules.filter(r => r.disabled).map(r => r.id) : null);
+  sel.onchange = () => showRules(presets.find(p => p.file === sel.value) || null, null);
+}
+$("censor-apply").onclick = async () => {
+  $("censor-err").textContent = "";
+  const file = $("censor-preset").value || null;
+  const disabled = [...document.querySelectorAll("#censor-rules input")].filter(i => !i.checked).map(i => i.dataset.rule);
+  try { await api("/api/censor", { file, disabled }); }
+  catch (e) { $("censor-err").textContent = e.message; }
+};
+function addCensorEvents(events) {
+  const log = $("censor-log");
+  for (const e of events) {
+    const d = document.createElement("div");
+    const hit = !["start", "preset", "expired", "error"].includes(e.action);
+    d.className = hit ? "hit" : "";
+    const t = new Date(e.t).toLocaleTimeString("en-GB");
+    const what = document.createElement("span");
+    what.className = "what";
+    what.textContent = hit ? `${e.rule}: ${e.action}` : e.action;
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent = ` ${t}${e.flow ? " · " + e.flow : ""}`;
+    d.append(what, meta);
+    if (e.detail) { const det = document.createElement("div"); det.style.border = "0"; det.style.padding = "0"; det.textContent = e.detail; d.append(det); }
+    if (hit && e.source) d.title = e.source;
+    log.prepend(d);
+  }
+  while (log.childElementCount > 150) log.lastElementChild.remove();
+}
+
 // Packet feed.
 const feed = $("feed");
 let paused = false;
@@ -240,8 +339,11 @@ function wireStream() {
       $("alarms").innerHTML = "";
       for (const a of m.alarms) { const d = document.createElement("div"); d.textContent = a; $("alarms").append(d); }
       $("needles").value = m.needles.map(n => `${n.label} = ${n.text}`).join("\n");
+      $("censor-log").innerHTML = "";
+      addCensorEvents(m.censor || []);
     } else {
       addRows(m.rows.slice().reverse(), m.dropped_rows);
+      if (m.censor && m.censor.length) addCensorEvents(m.censor);
       for (const r of m.rows.filter(r => r.alarm)) { const d = document.createElement("div"); d.textContent = r.note; $("alarms").prepend(d); }
     }
   };
@@ -261,6 +363,7 @@ api("/api/lab").then(l => {
   openConsole("server");
   wireStream();
   pollStatus(l.port);
+  loadCensor().catch(e => { $("censor-err").textContent = e.message; });
 }).catch(e => { document.body.textContent = "The panel did not answer: " + e.message; });
 
 // Whether the server listens on the lab port and the client is connected,
@@ -271,10 +374,10 @@ async function pollStatus(port) {
     const s = await api("/api/status");
     if (s.listening_error) set("server-status", "status unavailable: " + s.listening_error, false);
     else if (s.listening.length) set("server-status", "listening (" + s.listening.join(", ") + ")", true);
-    else set("server-status", `nothing listens on ${port} yet`, false);
+    else set("server-status", `nothing listens on tcp or udp ${port}`, false);
     if (s.client_error) set("client-status", "status unavailable: " + s.client_error, false);
-    else if (s.client_connections) set("client-status", `${s.client_connections} connection${s.client_connections > 1 ? "s" : ""} open`, true);
-    else set("client-status", "no connection", false);
+    else if (s.client_connections.length) set("client-status", `connected: ${s.client_connections.join(", ")}`, true);
+    else set("client-status", "no connected tcp or udp socket", false);
   } catch (e) { set("server-status", "status unavailable: " + e.message, false); }
   setTimeout(() => pollStatus(port), 2000);
 }

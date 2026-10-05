@@ -23,6 +23,12 @@ tc qdisc show dev "$IF_C" >> /out/wire-qdisc.txt
 # In a lab session the panel captures on demand through docker exec.
 if [ "${WIRE_CAPTURE:-1}" = 0 ]; then
     echo "$IF_C $IF_S" > /tmp/ifaces
+    # With the censor, the kernel does not forward (the lab sets
+    # ip_forward=0) and wl-censor routes every packet itself.
+    if [ "${WIRE_CENSOR:-0}" = 1 ]; then
+        /wl-wire/bin/wl-censor -client-if "$IF_C" -server-if "$IF_S" \
+            -preset /out/censor-preset.json -log /out/censor.jsonl 2> /out/censor-stderr.log &
+    fi
     touch /out/wire.ready
     trap 'exit 0' TERM INT
     while :; do sleep 3600 & wait $!; done

@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["wirelab-core", "wirelab-wire", "wirelab-sim", "wirelab-ostp", "wirelab-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+wirelab-core = { path = "wirelab-core" }
+wirelab-wire = { path = "wirelab-wire" }
+wirelab-sim = { path = "wirelab-sim" }
+wirelab-ostp = { path = "wirelab-ostp" }
+# The OSTP adapter drives the real protocol core from the sibling checkout:
+# a reimplementation would only test itself.
+ostp-core = { path = "../ostp/ostp-core" }
+
+anyhow = "1.0"
+bytes = "1.6"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.5"
+clap = { version = "4", features = ["derive"] }

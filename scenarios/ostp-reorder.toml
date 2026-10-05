@@ -1,0 +1,16 @@
+name = "ostp-reorder"
+description = "Clean 40 ms path where 1% of datagrams are overtaken by up to 15 ms."
+
+[protocol]
+name = "ostp"
+
+[wire]
+latency_ms = 40.0
+jitter_ms = 5.0
+reorder = 0.01
+reorder_delay_ms = 15.0
+impair_from_ms = 300.0
+
+[[transfer]]
+from = "server"
+bytes = 4_000_000

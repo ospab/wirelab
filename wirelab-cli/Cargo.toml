@@ -1,0 +1,20 @@
+[package]
+name = "wirelab-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "wirelab"
+path = "src/main.rs"
+
+[dependencies]
+wirelab-core.workspace = true
+wirelab-wire.workspace = true
+wirelab-sim.workspace = true
+wirelab-ostp.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true

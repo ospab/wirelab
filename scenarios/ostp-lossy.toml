@@ -1,0 +1,20 @@
+name = "ostp-lossy"
+description = "Mobile-like path: 40 ms ±10, 2% loss, 0.5% duplicates, 10 Mbit/s bottleneck."
+
+[protocol]
+name = "ostp"
+
+[wire]
+latency_ms = 40.0
+jitter_ms = 10.0
+loss = 0.02
+duplicate = 0.005
+bandwidth_kbps = 10_000.0
+queue_ms = 200.0
+# ostp-core does not resend a lost handshake datagram (the client bridge does),
+# so faults start after the handshake has had time to finish.
+impair_from_ms = 500.0
+
+[[transfer]]
+from = "server"
+bytes = 4_000_000

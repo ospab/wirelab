@@ -1,0 +1,12 @@
+name = "ostp-clean"
+description = "Handshake and a 2 MB upload over a clean 20 ms path."
+
+[protocol]
+name = "ostp"
+
+[wire]
+latency_ms = 20.0
+
+[[transfer]]
+from = "client"
+bytes = 2_000_000

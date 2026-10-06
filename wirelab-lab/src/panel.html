@@ -22,9 +22,13 @@
 html, body { margin: 0; height: 100%; }
 body { background: var(--paper); color: var(--text); font: 14px/1.45 var(--sans); }
 :focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
-.lab { display: grid; grid-template-columns: minmax(0, 1fr) 400px minmax(0, 1fr); height: 100vh; }
+.lab { display: grid; height: 100vh;
+       grid-template-columns: var(--w-client, minmax(0, 1fr)) 7px var(--w-wire, 400px) 7px minmax(0, 1fr); }
 .zone { display: flex; flex-direction: column; min-width: 0; }
-.zone + .zone { border-left: 1px solid var(--rule); }
+/* Column dividers: drag, or focus and use the arrow keys. */
+.splitter { cursor: col-resize; background: var(--paper); border-left: 1px solid var(--rule); touch-action: none; }
+.splitter:hover, .splitter:focus-visible, .splitter.dragging { background: var(--rule); outline: none; }
+.term-note { color: var(--alarm); }
 .zone-head { padding: 10px 14px 8px; border-bottom: 1px solid var(--rule); }
 .zone-head h2 { margin: 0; font-size: 15px; font-weight: 600; display: flex; gap: 10px; align-items: baseline; }
 .zone-head .addr { font: 13px var(--mono); color: var(--muted); }
@@ -77,7 +81,8 @@ select { font: 13px var(--sans); color: var(--text); background: var(--field); b
 #feed .gap { color: var(--muted); padding-left: 8px; }
 @media (max-width: 900px) {
   .lab { grid-template-columns: 1fr; height: auto; }
-  .zone + .zone { border-left: 0; border-top: 1px solid var(--rule); }
+  .splitter { display: none; }
+  .zone + .zone, .splitter + .zone { border-left: 0; border-top: 1px solid var(--rule); }
   .term { height: 360px; flex: none; }
   #wire { overflow: visible; }
 }
@@ -94,6 +99,8 @@ select { font: 13px var(--sans); color: var(--text); background: var(--field); b
     <div class="term" id="term-client"></div>
     <div class="zone-foot"><button data-reconnect="client">Reconnect</button><span id="client-state"></span></div>
   </div>
+  <div class="splitter" role="separator" aria-orientation="vertical" tabindex="0" data-split="client"
+       aria-label="Width of the client column"></div>
 
   <div class="zone" id="wire">
     <section>
@@ -117,6 +124,7 @@ select { font: 13px var(--sans); color: var(--text); background: var(--field); b
       </div>
       <div class="err" id="censor-err"></div>
       <p class="hint" id="censor-notes"></p>
+      <ul class="rules" id="censor-hyps"></ul>
       <ul class="rules" id="censor-rules"></ul>
       <div id="censor-log"></div>
     </section>
@@ -139,6 +147,8 @@ select { font: 13px var(--sans); color: var(--text); background: var(--field); b
     </section>
   </div>
 
+  <div class="splitter" role="separator" aria-orientation="vertical" tabindex="0" data-split="wire"
+       aria-label="Width of the wire column"></div>
   <div class="zone" id="server">
     <div class="zone-head">
       <h2>Server <span class="addr" id="server-ip"></span></h2>
@@ -181,39 +191,100 @@ function openConsole(zone) {
   ws.binaryType = "arraybuffer";
   const state = $(zone + "-state");
   ws.onopen = () => { state.textContent = `${term.cols}×${term.rows}`; term.focus(); };
+  const entry = { term, ws, fit, cols: term.cols, rows: term.rows };
   ws.onmessage = e => term.write(typeof e.data === "string" ? e.data : new Uint8Array(e.data));
   ws.onclose = () => { state.textContent = "disconnected"; };
   term.onData(d => { if (ws.readyState === 1) ws.send(d); });
-  consoles[zone] = { term, ws };
+  consoles[zone] = entry;
 }
+
+// After a column changes width the terminal is refitted here, but the shell
+// in the container keeps the size it was opened with until Reconnect.
+function refitConsoles() {
+  for (const [zone, c] of Object.entries(consoles)) {
+    c.fit.fit();
+    const state = $(zone + "-state");
+    if (c.term.cols !== c.cols || c.term.rows !== c.rows) {
+      state.innerHTML = "";
+      const note = document.createElement("span");
+      note.className = "term-note";
+      note.textContent = `size now ${c.term.cols}×${c.term.rows}, the shell still has ${c.cols}×${c.rows}: Reconnect to apply`;
+      state.append(note);
+    } else state.textContent = `${c.cols}×${c.rows}`;
+  }
+}
+
+const lab = document.querySelector(".lab");
+const widths = { client: null, wire: null };
+try { Object.assign(widths, JSON.parse(localStorage.getItem("wirelab-widths") || "{}")); } catch (e) {}
+function applyWidths() {
+  const total = lab.clientWidth - 14, minSide = 240, minWire = 280;
+  if (widths.wire != null) widths.wire = Math.max(minWire, Math.min(widths.wire, total - 2 * minSide));
+  if (widths.client != null) widths.client = Math.max(minSide, Math.min(widths.client, total - (widths.wire ?? 400) - minSide));
+  lab.style.setProperty("--w-client", widths.client != null ? widths.client + "px" : "minmax(0, 1fr)");
+  lab.style.setProperty("--w-wire", (widths.wire ?? 400) + "px");
+}
+function saveWidths() { try { localStorage.setItem("wirelab-widths", JSON.stringify(widths)); } catch (e) {} }
+function currentWidths() {
+  if (widths.client == null) widths.client = $("client").getBoundingClientRect().width;
+  if (widths.wire == null) widths.wire = $("wire").getBoundingClientRect().width;
+}
+for (const sp of document.querySelectorAll(".splitter")) {
+  const which = sp.dataset.split;
+  sp.addEventListener("pointerdown", e => {
+    currentWidths();
+    sp.setPointerCapture(e.pointerId);
+    sp.classList.add("dragging");
+    const startX = e.clientX, start = widths[which];
+    const move = ev => { widths[which] = start + ev.clientX - startX; applyWidths(); };
+    const up = () => {
+      sp.classList.remove("dragging");
+      sp.removeEventListener("pointermove", move);
+      sp.removeEventListener("pointerup", up);
+      saveWidths();
+      refitConsoles();
+    };
+    sp.addEventListener("pointermove", move);
+    sp.addEventListener("pointerup", up);
+  });
+  sp.addEventListener("keydown", e => {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    currentWidths();
+    widths[which] += (e.key === "ArrowRight" ? 1 : -1) * (e.shiftKey ? 80 : 20);
+    applyWidths();
+    saveWidths();
+    refitConsoles();
+  });
+}
+let resizeTimer;
+window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { applyWidths(); refitConsoles(); }, 200); });
+applyWidths();
 document.querySelectorAll("[data-reconnect]").forEach(b => b.onclick = () => openConsole(b.dataset.reconnect));
 
-// Wire controls.
-const fields = [["delay_ms", "delay, ms"], ["jitter_ms", "jitter, ms"], ["loss_pct", "loss, %"],
+// Impairments for the whole path. Delay and jitter are entered as round trip,
+// the way ping reports them, and split evenly between the two directions.
+const fields = [["rtt_ms", "delay (RTT), ms"], ["rtt_jitter_ms", "jitter (RTT), ms"], ["loss_pct", "loss, %"],
                 ["duplicate_pct", "duplicate, %"], ["corrupt_pct", "corrupt, %"], ["rate_kbit", "rate, kbit/s"]];
-function netemBlock(dir, title) {
-  const div = document.createElement("div");
-  div.className = "dirblock";
-  div.innerHTML = `<div class="row"><h3 class="${dir}" style="margin:0">${title}</h3><button data-apply="${dir}">Apply</button></div>
-    <div class="netem">${fields.map(([k, l]) => `<label>${l}<input type="number" min="0" step="any" value="0" id="${dir}-${k}"></label>`).join("")}</div>
-    <div class="tc" id="${dir}-tc"></div><div class="err" id="${dir}-err"></div>`;
-  return div;
-}
 const netem = $("netem");
-netem.innerHTML = "<h3>Impairments (netem)</h3>";
-netem.append(netemBlock("c2s", "c→s"), netemBlock("s2c", "s→c"));
-const hint = document.createElement("p");
-hint.className = "hint";
-hint.textContent = "All zeros remove the impairments. Jitter in netem reorders packets.";
-netem.append(hint);
+netem.innerHTML = `<div class="dirblock"><div class="row"><h3 style="margin:0">Impairments (netem)</h3><button id="netem-apply">Apply</button></div>
+  <div class="netem">${fields.map(([k, l]) => `<label>${l}<input type="number" min="0" step="any" value="0" id="netem-${k}"></label>`).join("")}</div>
+  <div class="err" id="netem-err"></div>
+  <p class="hint">Delay and jitter are halved for each direction. Loss, duplication and corruption apply in each direction, so 1% loss fails about 2% of round trips. Rate is per direction. All zeros remove the impairments; netem jitter reorders packets.</p>
+  <div class="tc"><span class="c2s">c→s</span> <span id="c2s-tc"></span></div>
+  <div class="tc"><span class="s2c">s→c</span> <span id="s2c-tc"></span></div></div>`;
 function showQdisc(q) { for (const d of ["c2s", "s2c"]) $(d + "-tc").textContent = q[d] || ""; }
-netem.querySelectorAll("[data-apply]").forEach(b => b.onclick = async () => {
-  const dir = b.dataset.apply, body = { dir };
-  for (const [k] of fields) body[k] = Number($(`${dir}-${k}`).value) || 0;
-  $(dir + "-err").textContent = "";
+$("netem-apply").onclick = async () => {
+  const body = {};
+  for (const [k] of fields) body[k] = Number($("netem-" + k).value) || 0;
+  $("netem-err").textContent = "";
   try { showQdisc((await api("/api/netem", body)).qdisc); }
-  catch (e) { $(dir + "-err").textContent = e.message; }
-});
+  catch (e) {
+    // A half-applied change comes back with both qdiscs as they now are.
+    try { const j = JSON.parse(e.message); $("netem-err").textContent = j.error; showQdisc(j.qdisc); }
+    catch (_) { $("netem-err").textContent = e.message; }
+  }
+};
 
 $("needles-apply").onclick = async () => {
   const list = $("needles").value.split("\n").map(l => l.trim()).filter(Boolean).map(l => {
@@ -239,6 +310,22 @@ function sourceLinks(src) {
     } else frag.append(document.createTextNode(part));
   }
   return frag;
+}
+function showHypotheses(preset, chosen) {
+  const ul = $("censor-hyps");
+  ul.innerHTML = "";
+  for (const h of (preset && preset.hypotheses) || []) {
+    const li = document.createElement("li");
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.dataset.hyp = h.id; cb.id = "hyp-" + h.id;
+    cb.checked = chosen && h.id in chosen ? chosen[h.id] : h.default;
+    const label = document.createElement("label");
+    label.htmlFor = cb.id; label.textContent = "Hypothesis: " + h.label;
+    const note = document.createElement("span");
+    note.className = "src"; note.textContent = h.note;
+    li.append(cb, label, note);
+    ul.append(li);
+  }
 }
 function showRules(preset, disabled) {
   const ul = $("censor-rules");
@@ -269,15 +356,24 @@ async function loadCensor() {
   for (const p of presets) { const o = document.createElement("option"); o.value = p.file; o.textContent = p.name; sel.append(o); }
   const active = c.active && presets.find(p => p.name === c.active.name);
   sel.value = active ? active.file : "";
-  showRules(active ? presets.find(p => p.file === sel.value) : null,
-            c.active ? c.active.rules.filter(r => r.disabled).map(r => r.id) : null);
-  sel.onchange = () => showRules(presets.find(p => p.file === sel.value) || null, null);
+  const shown = active ? presets.find(p => p.file === sel.value) : null;
+  showRules(shown, c.active ? c.active.rules.filter(r => r.disabled).map(r => r.id) : null);
+  const chosen = {};
+  for (const h of (c.active && c.active.hypotheses) || []) if ("chosen" in h) chosen[h.id] = h.chosen;
+  showHypotheses(shown, chosen);
+  sel.onchange = () => {
+    const p = presets.find(p => p.file === sel.value) || null;
+    showRules(p, null);
+    showHypotheses(p, null);
+  };
 }
 $("censor-apply").onclick = async () => {
   $("censor-err").textContent = "";
   const file = $("censor-preset").value || null;
   const disabled = [...document.querySelectorAll("#censor-rules input")].filter(i => !i.checked).map(i => i.dataset.rule);
-  try { await api("/api/censor", { file, disabled }); }
+  const hypotheses = {};
+  for (const i of document.querySelectorAll("#censor-hyps input")) hypotheses[i.dataset.hyp] = i.checked;
+  try { await api("/api/censor", { file, disabled, hypotheses }); }
   catch (e) { $("censor-err").textContent = e.message; }
 };
 function addCensorEvents(events) {

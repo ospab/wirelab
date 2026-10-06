@@ -15,10 +15,25 @@ import (
 // Preset is a censor model: an ordered list of rules, each tied to the
 // observation or paper it reproduces.
 type Preset struct {
-	Name  string `json:"name"`
-	AsOf  string `json:"as_of"`
-	Notes string `json:"notes"`
-	Rules []Rule `json:"rules"`
+	Name       string       `json:"name"`
+	AsOf       string       `json:"as_of"`
+	Notes      string       `json:"notes"`
+	Hypotheses []Hypothesis `json:"hypotheses"`
+	Rules      []Rule       `json:"rules"`
+}
+
+// Hypothesis is a behaviour the sources do not settle. The preset states
+// it, the panel lets you pick, and the choice is written into the listed
+// rules' Field, so a result can always say which assumption it rests on.
+type Hypothesis struct {
+	ID      string   `json:"id"`
+	Label   string   `json:"label"`
+	Field   string   `json:"field"`
+	Rules   []string `json:"rules"`
+	Default bool     `json:"default"`
+	Note    string   `json:"note"`
+	// Chosen is set in an active preset: the value written into the rules.
+	Chosen *bool `json:"chosen,omitempty"`
 }
 
 type Rule struct {
@@ -39,6 +54,9 @@ type Rule struct {
 	AllowSNI     []string `json:"allow_sni"`     // freeze
 	ExemptSSH    bool     `json:"exempt_ssh"`    // freeze
 	MaxData      int      `json:"max_data_packets"`
+	// sni: read the ClientHello from the TCP stream rather than from one
+	// segment, so splitting it across segments does not hide the name.
+	ReassembleHello bool `json:"reassemble_hello"`
 
 	nets []*net.IPNet
 }
@@ -61,9 +79,16 @@ type block struct {
 }
 
 type flow struct {
+	// ClientHello bytes gathered from the client's first segments, and what
+	// this packet made of them (see judge).
+	helloBuf     []byte
+	helloSettled bool
+	segHello     bool
+	segSNI       string
+	streamHello  bool
+	streamSNI    string
 	lastSeen     time.Time
 	packets      int
-	helloDone    bool
 	sni          string
 	ssh          bool
 	payloadSeen  bool
@@ -104,6 +129,39 @@ func (c *Censor) attribute(p *Packet, now time.Time) {
 		if !p.MoreFrags {
 			delete(c.frags, k)
 		}
+	}
+}
+
+// helloCap bounds how much of a client's opening the censor buffers looking
+// for a ClientHello; past it, or past helloSegs segments, it gives up.
+const (
+	helloCap  = 16 << 10
+	helloSegs = 8
+)
+
+// readHello sets what this packet reveals of a ClientHello: in the segment
+// alone (segHello) and in the stream so far (streamHello). Both are cleared
+// for every packet, so a rule only ever reacts to the packet that completed
+// the hello.
+func (c *Censor) readHello(f *flow, p Packet) {
+	f.segHello, f.streamHello = false, false
+	if f.helloSettled || p.Dir != dirC2S || p.Proto != 6 || len(p.Payload) == 0 {
+		return
+	}
+	if sni, ok := clientHelloSNI(p.Payload); ok {
+		f.segHello, f.segSNI, f.sni = true, sni, sni
+	}
+	f.helloBuf = append(f.helloBuf, p.Payload...)
+	b := f.helloBuf
+	if b[0] != 0x16 || len(b) > helloCap || f.packets > helloSegs*2 {
+		f.helloSettled, f.helloBuf = true, nil
+		return
+	}
+	if len(b) >= 5 && len(b) >= 5+(int(b[3])<<8|int(b[4])) {
+		if sni, ok := clientHelloSNI(b); ok {
+			f.streamHello, f.streamSNI, f.sni = true, sni, sni
+		}
+		f.helloSettled, f.helloBuf = true, nil
 	}
 }
 
@@ -304,6 +362,7 @@ func (c *Censor) judge(p Packet, now time.Time) verdict {
 		}
 	}
 
+	c.readHello(f, p)
 	if len(p.Payload) > 0 && !f.payloadSeen {
 		f.payloadSeen = true
 		f.ssh = bytes.HasPrefix(p.Payload, []byte("SSH-"))
@@ -364,19 +423,13 @@ func (c *Censor) apply(b *block, p Packet) verdict {
 func (c *Censor) match(r *Rule, f *flow, p Packet, now time.Time) (verdict, bool) {
 	switch r.Kind {
 	case "sni":
-		if p.Dir != dirC2S || p.Proto != 6 || len(p.Payload) == 0 || f.helloDone {
-			return verdict{}, false
+		hello, sni, how := f.segHello, f.segSNI, "in one segment"
+		if r.ReassembleHello {
+			hello, sni, how = f.streamHello, f.streamSNI, "reassembled from the stream"
 		}
-		sni, isHello := clientHelloSNI(p.Payload)
-		if !isHello {
-			return verdict{}, false
+		if hello && sni != "" && domainMatch(sni, r.Domains) {
+			return c.trigger(r, f, p, now, "ClientHello SNI "+sni+", "+how, r.DropTrigger), true
 		}
-		f.helloDone, f.sni = true, sni
-		if sni != "" && domainMatch(sni, r.Domains) {
-			return c.trigger(r, f, p, now, "ClientHello SNI "+sni, r.DropTrigger), true
-		}
-		// Later sni rules must still see this hello.
-		f.helloDone = false
 	case "quic_v1":
 		pl := p.Payload
 		if p.Dir == dirC2S && p.Proto == 17 && int(p.Key.ServerPort) == r.Port && len(pl) >= r.MinPayload &&

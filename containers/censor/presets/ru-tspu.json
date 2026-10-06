@@ -1,7 +1,21 @@
 {
   "name": "Russia (TSPU)",
   "as_of": "2025-06",
-  "notes": "Documented TSPU behaviours only. Domain and address lists are examples: the real registries are not public, fill in what you want to test. Not modelled: SNI-dependent QUIC blocking (Heitmann, FOCI 2026, observed 2022-2023, needs QUIC Initial decryption); SNI-III throttling (replaced by SNI-I on 2022-03-04); whether TSPU reassembles a ClientHello split across TCP segments (not established in the sources used).",
+  "notes": "Documented TSPU behaviours only. Domain and address lists are examples: the real registries are not public, fill in what you want to test. Not modelled: SNI-dependent QUIC blocking (Heitmann, FOCI 2026, observed 2022-2023, needs QUIC Initial decryption); SNI-III throttling (replaced by SNI-I on 2022-03-04).",
+  "hypotheses": [
+    {
+      "id": "tcp-reassembly",
+      "label": "TSPU reads a ClientHello split across TCP segments",
+      "field": "reassemble_hello",
+      "rules": [
+        "ru-sni-drop-all",
+        "ru-sni-rst",
+        "ru-sni-drop-after"
+      ],
+      "default": true,
+      "note": "Not settled by the sources used. On by default: assuming the stronger censor keeps a pass from being an artefact of a weak model. Turn it off to see whether splitting the ClientHello is what makes a protocol pass."
+    }
+  ],
   "rules": [
     {
       "id": "ru-sni-drop-all",
@@ -10,9 +24,14 @@
       "action": "drop_both",
       "drop_trigger": true,
       "block_seconds": 40,
-      "domains": ["facebook.com", "instagram.com", "twitter.com"],
+      "domains": [
+        "facebook.com",
+        "instagram.com",
+        "twitter.com"
+      ],
       "source": "Xue et al., TSPU: Russia's Decentralized Censorship System, IMC 2022, section 5.2 (SNI-IV) and Table 2 (40 s). https://ensa.fi/papers/tspu-imc22.pdf",
-      "disabled": true
+      "disabled": true,
+      "reassemble_hello": true
     },
     {
       "id": "ru-sni-rst",
@@ -20,8 +39,14 @@
       "kind": "sni",
       "action": "rst_s2c",
       "block_seconds": 75,
-      "domains": ["facebook.com", "instagram.com", "twitter.com", "blocked.example"],
-      "source": "Xue et al., IMC 2022, section 5.2 (SNI-I) and Table 2 (75 s). https://ensa.fi/papers/tspu-imc22.pdf"
+      "domains": [
+        "facebook.com",
+        "instagram.com",
+        "twitter.com",
+        "blocked.example"
+      ],
+      "source": "Xue et al., IMC 2022, section 5.2 (SNI-I) and Table 2 (75 s). https://ensa.fi/papers/tspu-imc22.pdf",
+      "reassemble_hello": true
     },
     {
       "id": "ru-sni-drop-after",
@@ -30,8 +55,13 @@
       "action": "drop_both",
       "after_packets": 5,
       "block_seconds": 420,
-      "domains": ["nordvpn.com", "play.google.com", "news.google.com"],
-      "source": "Xue et al., IMC 2022, section 5.2 (SNI-II, 'five to eight packets') and Table 2 (420 s). https://ensa.fi/papers/tspu-imc22.pdf"
+      "domains": [
+        "nordvpn.com",
+        "play.google.com",
+        "news.google.com"
+      ],
+      "source": "Xue et al., IMC 2022, section 5.2 (SNI-II, 'five to eight packets') and Table 2 (420 s). https://ensa.fi/papers/tspu-imc22.pdf",
+      "reassemble_hello": true
     },
     {
       "id": "ru-quic-v1",
@@ -73,7 +103,9 @@
       "kind": "freeze",
       "action": "drop_s2c",
       "after_packets": 25,
-      "cidrs": ["10.77.2.0/24"],
+      "cidrs": [
+        "10.77.2.0/24"
+      ],
       "exempt_ssh": true,
       "allow_sni": [],
       "source": "net4people/bbs #490 (2025-06-27, Update 5): frozen 'after 25 packets have been sent in either direction', tcp and udp, ~16 KB; no RST; SSH unaffected; whitelisted SNI pass. The lab server stands for a VPS in a foreign data centre; remove its network from cidrs to model a domestic server. https://github.com/net4people/bbs/issues/490"

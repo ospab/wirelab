@@ -244,3 +244,24 @@ func TestNoPresetPassesEverything(t *testing.T) {
 		t.Fatal("with no preset nothing is touched")
 	}
 }
+
+func TestSplitClientHelloDependsOnTheHypothesis(t *testing.T) {
+	hello := clientHello("blocked.example")
+	first, second := hello[:20], hello[20:]
+	for _, reassemble := range []bool{false, true} {
+		c := testCensor(t, `{"name":"t","rules":[{"id":"sni","kind":"sni","action":"drop_both","drop_trigger":true,
+			"block_seconds":75,"domains":["blocked.example"],"reassemble_hello":`+map[bool]string{false: "false", true: "true"}[reassemble]+`,"source":"test"}]}`)
+		v1 := judgeRaw(c, ipPacket(6, dirC2S, 5000, 443, tcpACK, first), dirC2S)
+		v2 := judgeRaw(c, ipPacket(6, dirC2S, 5000, 443, tcpACK, second), dirC2S)
+		if v1 != passPacket {
+			t.Fatalf("reassemble=%v: the first half carries no name and must pass", reassemble)
+		}
+		want := passPacket
+		if reassemble {
+			want = dropPacket
+		}
+		if v2 != want {
+			t.Fatalf("reassemble=%v: second half verdict %v, want %v", reassemble, v2, want)
+		}
+	}
+}

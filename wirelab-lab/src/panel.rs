@@ -245,20 +245,13 @@ async fn api_status(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<String,
     Json(status).into_response()
 }
 
-#[derive(Deserialize)]
+/// One direction of netem.
 struct NetemReq {
-    dir: String,
-    #[serde(default)]
     delay_ms: f64,
-    #[serde(default)]
     jitter_ms: f64,
-    #[serde(default)]
     loss_pct: f64,
-    #[serde(default)]
     duplicate_pct: f64,
-    #[serde(default)]
     corrupt_pct: f64,
-    #[serde(default)]
     rate_kbit: f64,
 }
 
@@ -296,48 +289,87 @@ fn netem_args(r: &NetemReq) -> Result<Vec<String>> {
     Ok(a)
 }
 
-async fn api_netem(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<String, String>>, h: HeaderMap, Json(r): Json<NetemReq>) -> Response {
+/// Impairments for the whole path, as a person thinks of them: the delay a
+/// ping would show (round trip) rather than per-direction one-way values.
+#[derive(Deserialize)]
+struct PathReq {
+    #[serde(default)]
+    rtt_ms: f64,
+    #[serde(default)]
+    rtt_jitter_ms: f64,
+    #[serde(default)]
+    loss_pct: f64,
+    #[serde(default)]
+    duplicate_pct: f64,
+    #[serde(default)]
+    corrupt_pct: f64,
+    #[serde(default)]
+    rate_kbit: f64,
+}
+
+impl PathReq {
+    /// One direction's netem: delay and jitter split evenly between the two
+    /// directions; loss, duplication, corruption and rate apply in each.
+    fn one_way(&self) -> NetemReq {
+        NetemReq {
+            delay_ms: self.rtt_ms / 2.0,
+            jitter_ms: self.rtt_jitter_ms / 2.0,
+            loss_pct: self.loss_pct,
+            duplicate_pct: self.duplicate_pct,
+            corrupt_pct: self.corrupt_pct,
+            rate_kbit: self.rate_kbit,
+        }
+    }
+}
+
+async fn api_netem(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<String, String>>, h: HeaderMap, Json(r): Json<PathReq>) -> Response {
     if !p.authorized(&q, &h) {
         return deny();
     }
-    let dev = match r.dir.as_str() {
-        "c2s" => p.if_to_server.clone(),
-        "s2c" => p.if_to_client.clone(),
-        _ => return (StatusCode::BAD_REQUEST, "dir must be c2s or s2c").into_response(),
-    };
-    let args = match netem_args(&r) {
-        Ok(a) => a,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-    };
-    let p2 = p.clone();
-    let dir = r.dir.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let mut cmd: Vec<String> = vec!["exec".into(), p2.info.wire.clone(), "tc".into(), "qdisc".into()];
-        let clearing = args.is_empty();
-        if clearing {
-            cmd.extend(["del".into(), "dev".into(), dev.clone(), "root".into()]);
-        } else {
-            cmd.extend(["replace".into(), "dev".into(), dev.clone(), "root".into(), "netem".into()]);
-            cmd.extend(args);
+    let mut plan = Vec::new();
+    for (dir, dev) in [("c2s", p.if_to_server.clone()), ("s2c", p.if_to_client.clone())] {
+        match netem_args(&r.one_way()) {
+            Ok(args) => plan.push((dir, dev, args)),
+            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
         }
-        let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-        let shown = cmd[2..].join(" ");
-        let res = p2.docker.run(&refs);
-        // Deleting a qdisc that is not there is the state we wanted anyway.
-        let res = match res {
-            Err(e) if clearing && e.to_string().contains("No such file") => Ok(String::new()),
-            other => other,
-        };
-        p2.session_append("wire-changes.log", &format!("{dir}: {shown} -> {}", match &res {
-            Ok(_) => "ok".to_string(),
-            Err(e) => format!("error: {e}"),
-        }));
-        res.map(|_| p2.qdisc())
+    }
+    let p2 = p.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        for (dir, dev, args) in plan {
+            let mut cmd: Vec<String> = vec!["exec".into(), p2.info.wire.clone(), "tc".into(), "qdisc".into()];
+            let clearing = args.is_empty();
+            if clearing {
+                cmd.extend(["del".into(), "dev".into(), dev.clone(), "root".into()]);
+            } else {
+                cmd.extend(["replace".into(), "dev".into(), dev.clone(), "root".into(), "netem".into()]);
+                cmd.extend(args);
+            }
+            let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+            let shown = cmd[2..].join(" ");
+            let res = match p2.docker.run(&refs) {
+                // Deleting a qdisc that is not there is the state we wanted anyway.
+                Err(e) if clearing && e.to_string().contains("No such file") => Ok(String::new()),
+                other => other,
+            };
+            p2.session_append("wire-changes.log", &format!("{dir}: {shown} -> {}", match &res {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("error: {e}"),
+            }));
+            // Stop at the first failure: the response then shows the qdiscs
+            // as they really are, half-applied or not.
+            if let Err(e) = res {
+                return Err(e);
+            }
+        }
+        Ok(p2.qdisc())
     })
     .await;
     match result {
         Ok(Ok(qdisc)) => Json(serde_json::json!({ "qdisc": qdisc })).into_response(),
-        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+        Ok(Err(e)) => {
+            let qdisc = p.qdisc();
+            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({ "error": e.to_string(), "qdisc": qdisc }))).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -581,6 +613,9 @@ struct CensorReq {
     /// Rule ids to switch off in this session.
     #[serde(default)]
     disabled: Vec<String>,
+    /// Hypothesis id -> chosen value; absent ones take the preset default.
+    #[serde(default)]
+    hypotheses: HashMap<String, bool>,
 }
 
 async fn api_censor_set(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<String, String>>, h: HeaderMap, Json(r): Json<CensorReq>) -> Response {
@@ -609,13 +644,35 @@ async fn api_censor_set(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<Str
             rule["disabled"] = serde_json::Value::Bool(r.disabled.contains(&id));
         }
     }
+    let mut chosen_note = Vec::new();
+    let hyps = preset["hypotheses"].as_array().cloned().unwrap_or_default();
+    for (i, h) in hyps.iter().enumerate() {
+        let id = h["id"].as_str().unwrap_or_default().to_string();
+        let value = r.hypotheses.get(&id).copied().unwrap_or(h["default"].as_bool().unwrap_or(false));
+        let field = h["field"].as_str().unwrap_or_default().to_string();
+        let targets: Vec<String> = h["rules"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+        if let Some(rules) = preset["rules"].as_array_mut() {
+            for rule in rules.iter_mut().filter(|rule| targets.iter().any(|t| rule["id"] == t.as_str())) {
+                rule[field.as_str()] = serde_json::Value::Bool(value);
+            }
+        }
+        preset["hypotheses"][i]["chosen"] = serde_json::Value::Bool(value);
+        chosen_note.push(format!("{id}={value}"));
+    }
     // Written whole and renamed, so the censor never reads half a file.
     let tmp = p.info.session.join("censor-preset.json.tmp");
     let write = std::fs::write(&tmp, serde_json::to_vec_pretty(&preset).unwrap()).and_then(|_| std::fs::rename(&tmp, &target));
     if let Err(e) = write {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
-    p.session_append("wire-changes.log", &format!("censor: {file}, rules off: {}", if r.disabled.is_empty() { "none".into() } else { r.disabled.join(",") }));
+    p.session_append(
+        "wire-changes.log",
+        &format!(
+            "censor: {file}, rules off: {}, hypotheses: {}",
+            if r.disabled.is_empty() { "none".into() } else { r.disabled.join(",") },
+            if chosen_note.is_empty() { "none".into() } else { chosen_note.join(",") }
+        ),
+    );
     Json(serde_json::json!({ "active": preset })).into_response()
 }
 
@@ -748,15 +805,21 @@ mod tests {
 
     #[test]
     fn netem_line_names_only_what_is_set() {
-        let r = NetemReq { dir: "c2s".into(), delay_ms: 40.0, jitter_ms: 0.0, loss_pct: 1.5, duplicate_pct: 0.0, corrupt_pct: 0.0, rate_kbit: 10000.0 };
+        let r = NetemReq { delay_ms: 40.0, jitter_ms: 0.0, loss_pct: 1.5, duplicate_pct: 0.0, corrupt_pct: 0.0, rate_kbit: 10000.0 };
         assert_eq!(netem_args(&r).unwrap().join(" "), "delay 40ms loss 1.5% rate 10000kbit");
         let empty = NetemReq { delay_ms: 0.0, loss_pct: 0.0, rate_kbit: 0.0, ..r };
         assert!(netem_args(&empty).unwrap().is_empty());
     }
 
     #[test]
+    fn round_trip_delay_is_split_between_directions() {
+        let path = PathReq { rtt_ms: 80.0, rtt_jitter_ms: 10.0, loss_pct: 1.0, duplicate_pct: 0.0, corrupt_pct: 0.0, rate_kbit: 0.0 };
+        assert_eq!(netem_args(&path.one_way()).unwrap().join(" "), "delay 40ms 5ms loss 1%");
+    }
+
+    #[test]
     fn netem_rejects_nonsense() {
-        let r = NetemReq { dir: "c2s".into(), delay_ms: 0.0, jitter_ms: 5.0, loss_pct: 0.0, duplicate_pct: 0.0, corrupt_pct: 0.0, rate_kbit: 0.0 };
+        let r = NetemReq { delay_ms: 0.0, jitter_ms: 5.0, loss_pct: 0.0, duplicate_pct: 0.0, corrupt_pct: 0.0, rate_kbit: 0.0 };
         assert!(netem_args(&r).is_err());
         let r = NetemReq { jitter_ms: 0.0, loss_pct: 150.0, ..r };
         assert!(netem_args(&r).is_err());

@@ -3,6 +3,7 @@ name = "wirelab-lab"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 wirelab-wire.workspace = true

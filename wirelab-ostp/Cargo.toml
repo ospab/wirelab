@@ -3,6 +3,7 @@ name = "wirelab-ostp"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 wirelab-core.workspace = true

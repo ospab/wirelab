@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -52,24 +53,58 @@ type Decision struct {
 }
 
 type block struct {
-	rule      *Rule
-	action    string
-	until     time.Time // zero: until the flow goes idle
-	passLeft  int
-	affected  int
+	rule     *Rule
+	action   string
+	until    time.Time // zero: until the flow goes idle
+	passLeft int
+	affected int
 }
 
 type flow struct {
-	lastSeen  time.Time
-	packets   int
-	helloDone bool
-	sni       string
-	ssh       bool
-	payloadSeen bool
+	lastSeen     time.Time
+	packets      int
+	helloDone    bool
+	sni          string
+	ssh          bool
+	payloadSeen  bool
 	wgInit, wgUp bool
-	ovpn       bool
-	dataCount  int
-	block      *block
+	ovpn         bool
+	dataCount    int
+	block        *block
+}
+
+type fragKey struct {
+	src, dst [4]byte
+	proto    uint8
+	id       uint16
+}
+
+type fragEntry struct {
+	key  FlowKey
+	seen time.Time
+}
+
+// The TSPU keeps fragments for about 5 s while reassembling (Xue et al.,
+// IMC 2022, section 5.3.1); a later fragment older than that is on its own.
+const fragHold = 5 * time.Second
+
+// attribute gives a non-first IP fragment the flow of its first fragment, so
+// per-flow counts and blocks cover the whole datagram.
+func (c *Censor) attribute(p *Packet, now time.Time) {
+	if p.FragOff == 0 && !p.MoreFrags {
+		return
+	}
+	k := fragKey{p.Src, p.Dst, p.Proto, p.FragID}
+	if p.FragOff == 0 {
+		c.frags[k] = fragEntry{p.Key, now}
+		return
+	}
+	if e, ok := c.frags[k]; ok && now.Sub(e.seen) <= fragHold {
+		p.Key = e.key
+		if !p.MoreFrags {
+			delete(c.frags, k)
+		}
+	}
 }
 
 type verdictKind int
@@ -83,21 +118,40 @@ const (
 type verdict struct{ kind verdictKind }
 
 type Censor struct {
-	mu      sync.Mutex
-	preset  *Preset
-	flows   map[FlowKey]*flow
-	cnet    *net.IPNet
-	snet    *net.IPNet
-	logMu   sync.Mutex
-	log     *os.File
+	mu     sync.Mutex
+	preset *Preset
+	flows  map[FlowKey]*flow
+	frags  map[fragKey]fragEntry
+	cnet   *net.IPNet
+	snet   *net.IPNet
+	logMu  sync.Mutex
+	log    io.Writer
+	// live: decisions are logged from a goroutine so the forwarding path
+	// never waits on the disk. A replay logs inline to keep the order.
+	live bool
+	// onDecision, when set, also receives every decision (replay summary).
+	onDecision func(Decision)
 }
 
-func newCensor(cnet, snet *net.IPNet, log *os.File) *Censor {
-	return &Censor{flows: map[FlowKey]*flow{}, cnet: cnet, snet: snet, log: log}
+func newCensor(cnet, snet *net.IPNet, log io.Writer) *Censor {
+	return &Censor{flows: map[FlowKey]*flow{}, frags: map[fragKey]fragEntry{}, cnet: cnet, snet: snet, log: log, live: true}
+}
+
+func (c *Censor) emit(d Decision) {
+	if c.live {
+		go c.event(d)
+	} else {
+		c.event(d)
+	}
 }
 
 func (c *Censor) event(d Decision) {
-	d.T = time.Now().UnixMilli()
+	if d.T == 0 {
+		d.T = time.Now().UnixMilli()
+	}
+	if c.onDecision != nil {
+		c.onDecision(d)
+	}
 	b, _ := json.Marshal(d)
 	c.logMu.Lock()
 	_, _ = c.log.Write(append(b, '\n'))
@@ -114,6 +168,11 @@ func (c *Censor) gcLoop() {
 		for k, f := range c.flows {
 			if time.Since(f.lastSeen) > flowIdle {
 				delete(c.flows, k)
+			}
+		}
+		for k, e := range c.frags {
+			if time.Since(e.seen) > fragHold {
+				delete(c.frags, k)
 			}
 		}
 		c.mu.Unlock()
@@ -218,13 +277,15 @@ func inNets(ip [4]byte, nets []*net.IPNet) bool {
 
 // judge decides one packet. Called for every forwarded packet, so it holds
 // the lock only for map and flow updates and logs outside the hot path.
-func (c *Censor) judge(p Packet) verdict {
+// now is the packet's time: the wall clock when routing, the capture
+// timestamp when replaying a file, so block expiry follows the traffic.
+func (c *Censor) judge(p Packet, now time.Time) verdict {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.preset == nil || (p.Proto != 6 && p.Proto != 17) {
 		return verdict{passPacket}
 	}
-	now := time.Now()
+	c.attribute(&p, now)
 	f := c.flows[p.Key]
 	if f == nil {
 		f = &flow{}
@@ -235,7 +296,7 @@ func (c *Censor) judge(p Packet) verdict {
 
 	if b := f.block; b != nil {
 		if !b.until.IsZero() && now.After(b.until) {
-			go c.event(Decision{Rule: b.rule.ID, Action: "expired", Flow: p.Key.String(),
+			c.emit(Decision{T: now.UnixMilli(), Rule: b.rule.ID, Action: "expired", Flow: p.Key.String(),
 				Detail: fmt.Sprintf("block lifted after %d s, %d packets affected", b.rule.BlockSeconds, b.affected)})
 			f.block = nil
 		} else {
@@ -269,7 +330,7 @@ func (c *Censor) trigger(r *Rule, f *flow, p Packet, now time.Time, detail strin
 		b.passLeft = r.AfterPackets
 	}
 	f.block = b
-	go c.event(Decision{Rule: r.ID, Action: r.Action, Flow: p.Key.String(), Detail: detail, Source: r.Source})
+	c.emit(Decision{T: now.UnixMilli(), Rule: r.ID, Action: r.Action, Flow: p.Key.String(), Detail: detail, Source: r.Source})
 	if dropThis {
 		b.affected++
 		return verdict{dropPacket}
@@ -324,7 +385,7 @@ func (c *Censor) match(r *Rule, f *flow, p Packet, now time.Time) (verdict, bool
 		}
 	case "ip":
 		if inNets(p.Key.ServerIP, r.nets) {
-			go c.event(Decision{Rule: r.ID, Action: r.Action, Flow: p.Key.String(), Detail: "address on the block list", Source: r.Source})
+			c.emit(Decision{T: now.UnixMilli(), Rule: r.ID, Action: r.Action, Flow: p.Key.String(), Detail: "address on the block list", Source: r.Source})
 			return verdict{dropPacket}, true
 		}
 	case "freeze":

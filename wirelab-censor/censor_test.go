@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 var (
@@ -83,7 +84,7 @@ func judgeRaw(c *Censor, ip []byte, dir Dir) verdictKind {
 	if !ok {
 		panic("unparsable test packet")
 	}
-	return c.judge(p).kind
+	return c.judge(p, time.Now()).kind
 }
 
 func TestRealPresetLoads(t *testing.T) {

@@ -12,7 +12,10 @@ pub const CLIENT_IP: &str = "10.77.1.3";
 pub const SERVER_IP: &str = "10.77.2.3";
 pub const WIRE_CLIENT_SIDE: &str = "10.77.1.2";
 pub const WIRE_SERVER_SIDE: &str = "10.77.2.2";
-pub const TARGET_URL: &str = "http://127.0.0.1:8080/blob";
+pub const TARGET_IP: &str = "10.77.3.10";
+/// The internet behind the server, by name: the server resolves it through
+/// /etc/hosts, so a proxy that resolves on the far side reaches it too.
+pub const TARGET_URL: &str = "http://target.lab/blob";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -78,7 +81,8 @@ impl LabInfo {
              wire     {WIRE_CLIENT_SIDE} (client side), {WIRE_SERVER_SIDE} (server side)\n\n\
              server listens on   0.0.0.0:{port}   (env WL_SERVER_PORT)\n\
              client connects to  {SERVER_IP}:{port}   (env WL_SERVER_ADDR, WL_SERVER_PORT)\n\n\
-             Behind the server: {TARGET_URL} (20 MB, sha256 in /srv/www/blob.sha256).\n\
+             Behind the server: {TARGET_URL} (20 MB) and http://target.lab/obj/1..40, from the server only.\n\
+             Each node runs /lab/setup.sh at start if it exists; output goes to /lab/setup.log.\n\
              Session records go to {session}\n\n\
              Panel:  wirelab lab panel --id {id}\n\
              Stop:   wirelab lab down --id {id}",
@@ -198,6 +202,10 @@ networks:
   net_s:
     {net_opts}
     ipam: {{config: [{{subnet: 10.77.2.0/24}}]}}
+  # Only the server and the target are on it, and it has no way out.
+  net_t:
+    internal: true
+    ipam: {{config: [{{subnet: 10.77.3.0/24}}]}}
 services:
   wire:
     image: wl-wire
@@ -215,19 +223,30 @@ services:
     container_name: {client}
     hostname: client
     cap_add: [NET_ADMIN]
+    entrypoint: ["/bin/sh", "/wl-node/node.sh"]
     environment: {{ROLE: client, WL_SERVER_ADDR: "{sip}", WL_SERVER_PORT: "{port}"}}
     networks: {{net_c: {{ipv4_address: {cip}}}}}
-    volumes: ["./client:/lab"]
+    volumes: ["./client:/lab", "../../containers/node:/wl-node:ro"]
     depends_on: [wire]
   server:
     image: {node_image}
     container_name: {server}
     hostname: server
     cap_add: [NET_ADMIN]
+    entrypoint: ["/bin/sh", "/wl-node/node.sh"]
     environment: {{ROLE: server, WL_SERVER_ADDR: "{sip}", WL_SERVER_PORT: "{port}"}}
-    networks: {{net_s: {{ipv4_address: {sip}}}}}
-    volumes: ["./server:/lab"]
-    depends_on: [wire]
+    networks: {{net_s: {{ipv4_address: {sip}}}, net_t: {{ipv4_address: 10.77.3.2}}}}
+    extra_hosts: ["target.lab:{tip}"]
+    volumes: ["./server:/lab", "../../containers/node:/wl-node:ro"]
+    depends_on: [wire, target]
+  target:
+    image: {node_image}
+    container_name: {target}
+    hostname: target
+    entrypoint: ["/bin/sh", "/wl-node/node.sh"]
+    environment: {{ROLE: target}}
+    networks: {{net_t: {{ipv4_address: {tip}}}}}
+    volumes: ["../../containers/node:/wl-node:ro"]
 "#,
         project = info.project,
         wire = info.wire,
@@ -238,6 +257,8 @@ services:
         ws = WIRE_SERVER_SIDE,
         cip = CLIENT_IP,
         sip = SERVER_IP,
+        tip = TARGET_IP,
+        target = format!("{}-target", info.project),
         port = info.server_port,
         forward = if info.censor { 0 } else { 1 },
         censor = if info.censor { 1 } else { 0 },

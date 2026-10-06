@@ -43,6 +43,12 @@ type Packet struct {
 	L4       int // offset of the transport header within the IP packet
 	Payload  []byte
 	TCPFlags byte
+	// IP fragmentation: a non-first fragment has no transport header, so its
+	// ports come from the first fragment (see Censor.attribute).
+	FragID    uint16
+	FragOff   uint16
+	MoreFrags bool
+	Src, Dst  [4]byte
 }
 
 const (
@@ -70,6 +76,8 @@ func parsePacket(ip []byte, dir Dir) (Packet, bool) {
 	copy(a[:], ip[12:16])
 	copy(b[:], ip[16:20])
 	fragOff := binary.BigEndian.Uint16(ip[6:8]) & 0x1fff
+	p.FragID, p.FragOff, p.MoreFrags = binary.BigEndian.Uint16(ip[4:6]), fragOff, ip[6]&0x20 != 0
+	p.Src, p.Dst = a, b
 	var sport, dport uint16
 	if fragOff == 0 {
 		switch p.Proto {

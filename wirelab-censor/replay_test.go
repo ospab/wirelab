@@ -97,6 +97,7 @@ func TestBothCaptureFormatsRead(t *testing.T) {
 }
 
 func TestReplayReportsTheFreeze(t *testing.T) {
+	presetsOrSkip(t)
 	dir := t.TempDir()
 	capPath := filepath.Join(dir, "c.pcap")
 	os.WriteFile(capPath, pcapFile(udpExchange(40)), 0o644)
@@ -107,7 +108,7 @@ func TestReplayReportsTheFreeze(t *testing.T) {
 		t.Fatal(err)
 	}
 	report := out.String()
-	for _, want := range []string{"40 judged", "ru-freeze-16k (drop_s2c): 1 flow", "at packet 26 of 40"} {
+	for _, want := range []string{"40 judged", "ru-freeze (drop_both): 1 flow", "at packet 26 of 40"} {
 		if !strings.Contains(report, want) {
 			t.Errorf("report lacks %q:\n%s", want, report)
 		}
@@ -115,6 +116,7 @@ func TestReplayReportsTheFreeze(t *testing.T) {
 }
 
 func TestReplayMapsLabNetworks(t *testing.T) {
+	presetsOrSkip(t)
 	p, err := loadPreset("../containers/censor/presets/ru-tspu.json")
 	if err != nil {
 		t.Fatal(err)
@@ -126,7 +128,7 @@ func TestReplayMapsLabNetworks(t *testing.T) {
 		t.Fatal("the freeze rule's lab network must be mapped onto the capture's server")
 	}
 	for _, r := range p.Rules {
-		if r.ID == "ru-freeze-16k" && !inNets([4]byte{203, 0, 113, 7}, r.nets) {
+		if r.ID == "ru-freeze" && !inNets([4]byte{203, 0, 113, 7}, r.nets) {
 			t.Fatal("freeze rule must now cover 203.0.113.7")
 		}
 	}

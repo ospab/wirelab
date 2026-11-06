@@ -1,7 +1,7 @@
 {
   "name": "Russia (TSPU)",
-  "as_of": "2025-06",
-  "notes": "Documented TSPU behaviours only. Domain and address lists are examples: the real registries are not public, fill in what you want to test. Not modelled: SNI-dependent QUIC blocking (Heitmann, FOCI 2026, observed 2022-2023, needs QUIC Initial decryption); SNI-III throttling (replaced by SNI-I on 2022-03-04).",
+  "as_of": "2026-10",
+  "notes": "Documented TSPU behaviours only; the lab server stands for a VPS in a foreign data centre. Domain and address lists are examples: the real registries are not public, fill in what you want to test. Rules marked as needing nDPI (QUIC SNI, JA4) do not fire with the built-in classifier; the censor's start line says which. Not modelled: DTLS blocking by JA4 fingerprint (net4people/bbs #603, 2026-03-30: the pion/dtls default handshake; the fingerprint value is not published, capture one and add a rule); TUN detection (#663, unconfirmed); mass IP bans (#671: put the addresses in ru-ip); SNI-III throttling (replaced by SNI-I on 2022-03-04). Mobile whitelist mode is its own preset.",
   "hypotheses": [
     {
       "id": "tcp-reassembly",
@@ -14,6 +14,46 @@
       ],
       "default": true,
       "note": "Not settled by the sources used. On by default: assuming the stronger censor keeps a pass from being an artefact of a weak model. Turn it off to see whether splitting the ClientHello is what makes a protocol pass."
+    },
+    {
+      "id": "sni-tied-to-cidr",
+      "label": "A whitelisted SNI exempts a flow from the freeze only on the whitelisted domain's own addresses",
+      "field": "sni_tied_to_cidr",
+      "rules": [
+        "ru-freeze"
+      ],
+      "default": true,
+      "note": "net4people/bbs #490, 2026-01-17: 'Hard tie to whitelisted domain and its CIDR. Spoofing domains if it's wrong ip address will not work.' Earlier (2025-10-27, 2026-02-13) borrowing a whitelisted SNI such as api.oneme.ru or ozon.ru was reported to work; turn this off to model that."
+    },
+    {
+      "id": "freeze-counts-bytes",
+      "label": "The freeze counts bytes from the server rather than packets in either direction",
+      "field": "count_bytes",
+      "rules": [
+        "ru-freeze"
+      ],
+      "default": false,
+      "note": "#490 Update 5 says 25 packets either way, about 16 KB; later measurements (2026-02-13) saw the cut between 14 and 34 KB, about 25 KB for HTTPS. On: cut at max_s2c_bytes from the server instead."
+    },
+    {
+      "id": "rdp-exempt",
+      "label": "RDP is spared by the freeze, like SSH",
+      "field": "exempt_rdp",
+      "rules": [
+        "ru-freeze"
+      ],
+      "default": false,
+      "note": "#490 Update 2: 'SSH/sFTP + and sometimes RDP' work; 2025-07-01: 'RDP already banned'."
+    },
+    {
+      "id": "tls-rate-by-fingerprint",
+      "label": "The TLS connection limit blocks only ClientHellos with the same fingerprint",
+      "field": "by_fingerprint",
+      "rules": [
+        "ru-tls-rate"
+      ],
+      "default": true,
+      "note": "Habr 1010336, quoted in #603: 'a new TLS connection with the same fingerprint can no longer be established'. Needs JA4 from nDPI; the built-in classifier counts all fingerprints together."
     }
   ],
   "rules": [
@@ -64,14 +104,33 @@
       "reassemble_hello": true
     },
     {
+      "id": "ru-quic-sni",
+      "name": "QUIC v1 Initial with a blocked SNI, any UDP port: drop the flow for 420 s, renewed by each new Initial",
+      "kind": "quic_sni",
+      "action": "drop_both",
+      "quic_versions": [
+        1
+      ],
+      "block_seconds": 420,
+      "restart_on_trigger": true,
+      "domains": [
+        "facebook.com",
+        "instagram.com",
+        "twitter.com",
+        "blocked.example"
+      ],
+      "source": "Heitmann, Niere, Graf Lange, Somorovsky: On Russia's Early Introduction of QUIC SNI Censorship, FOCI 2026 (summary in net4people/bbs #654): decrypted Initial, SNI blocklist matching the TCP one, packets dropped, 420 s residual on the 4-tuple restarted by another blocked Initial, all UDP ports, QUIC v1 only (not v2), outbound only. https://www.petsymposium.org/foci/2026/foci-2026-0010.php"
+    },
+    {
       "id": "ru-quic-v1",
-      "name": "QUIC v1 to UDP 443 with at least 1001 payload bytes: drop the flow",
+      "name": "QUIC v1 to UDP 443 with at least 1001 payload bytes: drop the flow (2022; replaced by SNI filtering)",
       "kind": "quic_v1",
       "action": "drop_both",
       "port": 443,
       "min_payload": 1001,
       "block_seconds": 420,
-      "source": "Xue et al., IMC 2022, section 5.2 (QUIC blocking, version 0x00000001, >= 1001 bytes, from the local side) and Table 2 (420 s). https://ensa.fi/papers/tspu-imc22.pdf"
+      "disabled": true,
+      "source": "Xue et al., IMC 2022, section 5.2 (QUIC blocking, version 0x00000001, >= 1001 bytes, from the local side) and Table 2 (420 s); replaced between May 2022 and July 2023 by SNI-based filtering (FOCI 2026, 'Period B'). https://ensa.fi/papers/tspu-imc22.pdf"
     },
     {
       "id": "ru-ip",
@@ -79,7 +138,7 @@
       "kind": "ip",
       "action": "drop_both",
       "cidrs": [],
-      "source": "Xue et al., IMC 2022, section 5.2 (IP-based blocking). https://ensa.fi/papers/tspu-imc22.pdf"
+      "source": "Xue et al., IMC 2022, section 5.2 (IP-based blocking); mass bans of VPS addresses on 2026-08-04 and 2026-09-21, net4people/bbs #671. https://ensa.fi/papers/tspu-imc22.pdf"
     },
     {
       "id": "ru-wireguard",
@@ -98,17 +157,86 @@
       "source": "net4people/bbs #274, 2023-08-07: 'more than 15 packets with data (P_DATA), after a successful handshake'. https://github.com/net4people/bbs/issues/274"
     },
     {
-      "id": "ru-freeze-16k",
-      "name": "Foreign data-centre servers: freeze after about 25 packets",
+      "id": "ru-freeze",
+      "name": "Foreign data-centre servers: freeze after about 25 packets; UDP blocks the server for 10 minutes",
       "kind": "freeze",
       "action": "drop_s2c",
       "after_packets": 25,
+      "max_s2c_bytes": 25000,
+      "udp_host_seconds": 600,
       "cidrs": [
         "10.77.2.0/24"
       ],
-      "exempt_ssh": true,
-      "allow_sni": [],
-      "source": "net4people/bbs #490 (2025-06-27, Update 5): frozen 'after 25 packets have been sent in either direction', tcp and udp, ~16 KB; no RST; SSH unaffected; whitelisted SNI pass. The lab server stands for a VPS in a foreign data centre; remove its network from cidrs to model a domestic server. https://github.com/net4people/bbs/issues/490"
+      "exempt_protocols": [
+        "SSH"
+      ],
+      "allow_sni": [
+        "api.oneme.ru",
+        "ozon.ru",
+        "yandex.ru",
+        "vk.com"
+      ],
+      "sni_cidrs": [],
+      "sni_tied_to_cidr": true,
+      "source": "net4people/bbs #490: server-to-client packets stop, no RST, tcp and udp, 'after 25 packets have been sent in either direction' (Update 5), 14-34 KB depending on operator and protocol (2026-02-13); SSH unaffected (Update 2); whitelisted SNI pass (Update 3), tied to the domain's CIDR since 2026-01 (Update 4, 2026-01-17); UDP: 'complete blocking of access to the server for N minutes (about 10)' (2025-06-28). The lab server stands for a VPS in a foreign data centre; remove its network from cidrs to model a domestic one. https://github.com/net4people/bbs/issues/490"
+    },
+    {
+      "id": "ru-encapsulated-tls",
+      "name": "Fully encrypted protocol carrying TLS: three or more large client packets while the server sends more often",
+      "kind": "encapsulated_tls",
+      "action": "drop_both",
+      "min_client_packets": 3,
+      "min_client_size": 411,
+      "within_packets": 30,
+      "only_unknown": true,
+      "ports": [
+        443
+      ],
+      "cidrs": [
+        "10.77.2.0/24"
+      ],
+      "source": "net4people/bbs #363 (2024-05): Shadowsocks and VMess blocked when 'the client sends at least 3 packets, each of which is 411 bytes or larger, and the server sends packets more frequently than the client'; TCP only; depends on the server's network and on port 443 (2024-05-18). Seen on mobile operators; fully encrypted UDP and UoT were still cut on MegaFon in 2026-10 (#673). The 30-packet window is this preset's choice. https://github.com/net4people/bbs/issues/363"
+    },
+    {
+      "id": "ru-tls-rate",
+      "name": "About 12 TLS connections with SNI to one server in a short time: new ClientHellos dropped for 120 s",
+      "kind": "tls_rate",
+      "action": "drop_both",
+      "max_conns": 11,
+      "window_seconds": 10,
+      "block_seconds": 120,
+      "by_fingerprint": true,
+      "ports": [
+        443
+      ],
+      "source": "Habr 1010336 (MTS home, Novosibirsk, 2025-11-23), quoted in net4people/bbs #603: '~12 TLS connections with SNI to the same server in a short time triggers a block ... the block is dropped after about 120 seconds and does not affect connections without SNI'; #546: home ISPs from 2025-11-12, port 443 only, about 60 s. The 10 s window is this preset's choice: the sources say 'a short time'. https://github.com/net4people/bbs/issues/603"
+    },
+    {
+      "id": "ru-dns-udp",
+      "name": "UDP DNS to any resolver: blocked names answered NXDOMAIN; DNS over TCP untouched",
+      "kind": "dns_udp",
+      "action": "nxdomain",
+      "domains": [
+        "rutracker.org",
+        "youtube.com",
+        "whatsapp.com",
+        "ua",
+        "blocked.example"
+      ],
+      "source": "net4people/bbs #657 (2026-08-26): UDP queries to 8.8.8.8 for blocked names return NXDOMAIN, TCP queries the real answer; the TSPU DNATs UDP DNS to the national resolver NSDI (195.208.5.1, 2026-08-27). Modelled as the answer the client receives. https://github.com/net4people/bbs/issues/657"
+    },
+    {
+      "id": "ru-ssh-police",
+      "name": "SSH held to about 2 KB/s after 10-20 KB (some mobile regions)",
+      "kind": "police",
+      "action": "police",
+      "protocols": [
+        "SSH"
+      ],
+      "after_bytes": 15000,
+      "rate_kbit": 16,
+      "disabled": true,
+      "source": "net4people/bbs #490, 2025-07-08 (mobile, Irkutsk Oblast) and 2025-07-17 (Tver Oblast): 'SSH (domestic and abroad) is being throttled to <=2Kb/s after ~10-20Kb'. Off by default: regional. https://github.com/net4people/bbs/issues/490"
     }
   ]
 }

@@ -87,14 +87,30 @@ func judgeRaw(c *Censor, ip []byte, dir Dir) verdictKind {
 	return c.judge(p, time.Now()).kind
 }
 
-func TestRealPresetLoads(t *testing.T) {
-	p, err := loadPreset("../containers/censor/presets/ru-tspu.json")
-	if err != nil {
-		t.Fatal(err)
+func TestRealPresetsLoad(t *testing.T) {
+	presetsOrSkip(t)
+	files, _ := filepath.Glob("../containers/censor/presets/*.json")
+	if len(files) < 2 {
+		t.Fatalf("expected the presets, found %v", files)
 	}
-	for _, r := range p.Rules {
-		if !strings.Contains(r.Source, "http") {
-			t.Errorf("rule %s cites no link: %q", r.ID, r.Source)
+	for _, f := range files {
+		p, err := loadPreset(f)
+		if err != nil {
+			t.Fatalf("%s: %v", f, err)
+		}
+		ids := map[string]bool{}
+		for _, r := range p.Rules {
+			ids[r.ID] = true
+			if !strings.Contains(r.Source, "http") {
+				t.Errorf("%s: rule %s cites no link: %q", f, r.ID, r.Source)
+			}
+		}
+		for _, h := range p.Hypotheses {
+			for _, id := range h.Rules {
+				if !ids[id] {
+					t.Errorf("%s: hypothesis %s names rule %s, which is not in the preset", f, h.ID, id)
+				}
+			}
 		}
 	}
 }
@@ -147,7 +163,7 @@ func TestSNIDropAfterLetsSomePacketsThrough(t *testing.T) {
 
 func TestFreezeAfter25PacketsDropsOnlyServerSide(t *testing.T) {
 	c := testCensor(t, `{"name":"t","rules":[{"id":"fz","kind":"freeze","action":"drop_s2c","after_packets":25,
-		"cidrs":["10.77.2.0/24"],"exempt_ssh":true,"source":"test"}]}`)
+		"cidrs":["10.77.2.0/24"],"exempt_protocols":["SSH"],"source":"test"}]}`)
 	for i := 0; i < 25; i++ {
 		dir := Dir(i % 2)
 		sp, dp := uint16(5000), uint16(443)
@@ -168,7 +184,7 @@ func TestFreezeAfter25PacketsDropsOnlyServerSide(t *testing.T) {
 
 func TestFreezeSparesSSH(t *testing.T) {
 	c := testCensor(t, `{"name":"t","rules":[{"id":"fz","kind":"freeze","action":"drop_s2c","after_packets":3,
-		"cidrs":["10.77.2.0/24"],"exempt_ssh":true,"source":"test"}]}`)
+		"cidrs":["10.77.2.0/24"],"exempt_protocols":["SSH"],"source":"test"}]}`)
 	judgeRaw(c, ipPacket(6, dirS2C, 22, 5000, tcpACK, []byte("SSH-2.0-OpenSSH_9.6\r\n")), dirS2C)
 	for i := 0; i < 10; i++ {
 		if v := judgeRaw(c, ipPacket(6, dirS2C, 22, 5000, tcpACK, []byte("x")), dirS2C); v != passPacket {

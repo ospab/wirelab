@@ -77,6 +77,18 @@ func (c *Censor) pump(in, out *Port, dst *net.IPNet, dir Dir) {
 		case passPacket:
 		case dropPacket:
 			continue
+		case injectReply:
+			// Back where the query came from, to the MAC that sent it.
+			reply := verdict.reply
+			if !finishForward(reply) {
+				continue
+			}
+			back := append(make([]byte, 14, 14+len(reply)), reply...)
+			back[12], back[13] = 0x08, 0x00
+			if err := in.send(back, net.HardwareAddr(frame[6:12])); err != nil {
+				c.event(Decision{Rule: "-", Action: "error", Detail: "send on " + in.name + ": " + err.Error()})
+			}
+			continue
 		case rewriteRST:
 			if ipLen = toRSTAck(ip, pkt); ipLen == 0 {
 				continue

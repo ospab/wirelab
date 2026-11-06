@@ -49,6 +49,8 @@ type Packet struct {
 	FragOff   uint16
 	MoreFrags bool
 	Src, Dst  [4]byte
+	// Raw is the whole IP packet, for the classifier.
+	Raw []byte
 }
 
 const (
@@ -71,7 +73,7 @@ func parsePacket(ip []byte, dir Dir) (Packet, bool) {
 		return Packet{}, false
 	}
 	ip = ip[:total]
-	p := Packet{Dir: dir, Proto: ip[9], IHL: ihl, L4: ihl}
+	p := Packet{Dir: dir, Proto: ip[9], IHL: ihl, L4: ihl, Raw: ip}
 	var a, b [4]byte
 	copy(a[:], ip[12:16])
 	copy(b[:], ip[16:20])
@@ -260,4 +262,51 @@ func (r *reader) u24() uint32 {
 		return 0
 	}
 	return uint32(v[0])<<16 | uint32(v[1])<<8 | uint32(v[2])
+}
+
+// nxdomainReply answers the UDP DNS query in p with NXDOMAIN, from the
+// resolver's address: what the client sees when the TSPU sends its UDP DNS
+// to the national resolver instead (net4people/bbs #657). Returns the whole
+// IP packet, or nil if p is not a query it can answer.
+func nxdomainReply(p Packet) []byte {
+	q := p.Payload
+	if p.Proto != 17 || len(q) < 12 || p.FragOff != 0 || p.MoreFrags {
+		return nil
+	}
+	// Header and the first question; additional records (EDNS) are dropped.
+	end := 12
+	for end < len(q) && q[end] != 0 {
+		if q[end]&0xc0 != 0 {
+			return nil
+		}
+		end += 1 + int(q[end])
+	}
+	end += 1 + 4 // root label, QTYPE, QCLASS
+	if end > len(q) {
+		return nil
+	}
+	dns := append([]byte(nil), q[:end]...)
+	dns[2] = 0x80 | dns[2]&0x79 // QR, keep opcode and RD
+	dns[3] = 0x80 | 3           // RA, RCODE NXDOMAIN
+	binary.BigEndian.PutUint16(dns[4:6], 1)
+	binary.BigEndian.PutUint16(dns[6:8], 0)
+	binary.BigEndian.PutUint16(dns[8:10], 0)
+	binary.BigEndian.PutUint16(dns[10:12], 0)
+
+	total := 20 + 8 + len(dns)
+	ip := make([]byte, total)
+	ip[0] = 0x45
+	binary.BigEndian.PutUint16(ip[2:4], uint16(total))
+	ip[6] = 0x40 // DF
+	ip[8] = 64
+	ip[9] = 17
+	copy(ip[12:16], p.Dst[:])
+	copy(ip[16:20], p.Src[:])
+	binary.BigEndian.PutUint16(ip[20:22], p.Key.ServerPort)
+	binary.BigEndian.PutUint16(ip[22:24], p.Key.ClientPort)
+	binary.BigEndian.PutUint16(ip[24:26], uint16(8+len(dns)))
+	copy(ip[28:], dns)
+	// finishForward decrements the TTL and fills in both checksums.
+	ip[8]++
+	return ip
 }

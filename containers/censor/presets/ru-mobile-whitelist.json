@@ -1,0 +1,39 @@
+{
+  "name": "Russia, mobile whitelist mode",
+  "as_of": "2026-10",
+  "notes": "The default-deny mode switched on for mobile networks in some regions and hours: only allowed networks (and allowed SNI on their own addresses) work. The lab server is not on the list, so a tunnel to it fails; add 10.77.2.0/24 to cidrs to model a server on an allowed Russian cloud network (#650). The real lists are not public; community-maintained ones exist.",
+  "hypotheses": [
+    {
+      "id": "sni-tied-to-cidr",
+      "label": "An allowed SNI counts only on the allowed domain's own addresses",
+      "field": "sni_tied_to_cidr",
+      "rules": [
+        "ru-wl"
+      ],
+      "default": true,
+      "note": "#516, 2025-10-05: 'no matter what SNI you spoof, it won't connect to your own server ... it's an IP whitelist'. Off: an allowed SNI opens any address."
+    }
+  ],
+  "rules": [
+    {
+      "id": "ru-wl",
+      "name": "Whitelist: TCP handshakes complete, but no data reaches servers off the list; UDP and ICMP to them dropped",
+      "kind": "whitelist",
+      "action": "drop_payload",
+      "cidrs": [
+        "10.77.9.0/24"
+      ],
+      "allow_sni": [
+        "gosuslugi.ru",
+        "vk.com",
+        "ya.ru",
+        "max.ru"
+      ],
+      "sni_cidrs": [
+        "10.77.9.0/24"
+      ],
+      "sni_tied_to_cidr": true,
+      "source": "net4people/bbs #516 (2025-09): 'curl hangs on client hello (TCP syn is actually delivered remotely but not client hello)', ICMP to off-list addresses empty, 'it's an IP whitelist'; #650 (2026-08): default-deny with CIDR+SNI on MTS LTE. https://github.com/net4people/bbs/issues/516"
+    }
+  ]
+}

@@ -1,88 +1,72 @@
 # wirelab
 
-A test bench for censorship-resistant transport protocols. A lab is three
-zones: the client, the server, and the wire between them. You run your own
-client and server binaries; the wire carries their traffic through link
-impairments and a censor model, and shows what an observer on the path
-would see.
+[Русский](README.ru.md) · [Documentation](docs/README.md) · [Roadmap](docs/ROADMAP.md) · [Contributing](CONTRIBUTING.md)
 
-[Русская версия](README.ru.md)
+![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)
+![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20(WSL2)-green.svg)
+![Docker](https://img.shields.io/badge/runs%20on-Docker-2496ED.svg)
 
-## What is in it
+**A test bench for censorship-resistant transport protocols.** A client, a server, and the wire between them. The wire carries their traffic through link impairments and a model of a real censor, and shows what an observer on the path sees. Run it by hand from a browser panel, or let it run a whole matrix of protocols, versions, censors and network conditions on its own and hand you a table of PASS, FAIL and NO DATA.
 
-- **Lab** (`wirelab lab`): client, wire and server as containers, plus a
-  target that stands for the internet behind the server. A local panel gives
-  you a console in the client and in the server, the live packet capture,
-  link impairments (netem) and the censor controls.
-- **Censor** (`wl-censor`): routes the lab and applies a preset of censor
-  behaviours. Each rule cites the paper or report it reproduces; behaviour
-  the sources leave open is a named hypothesis you switch on or off. The
-  same engine judges any pcap or pcapng file.
-- **Simulator** (`wirelab run`): both ends in one process over a simulated
-  link, for protocols with a sans-io core. OSTP is the one adapter so far.
+Everything runs on your machine, in Docker: no CI minutes, no VPS, as many runs as you like.
 
-Results are reported as `PASS`, `FAIL` or `NO DATA`. A check that could not
-measure says so; it is never counted as a pass.
+## What is inside
 
-## Requirements
+- **Lab.** Client, wire, server and a target site behind the server, as containers on isolated networks. A local panel gives you a console in the client and in the server, the live capture with dissected handshakes, throughput and RTT charts, path impairments (netem) and the censor controls. A session packs into one archive.
+- **Recipes.** OSTP (UDP, UoT, TLS), VLESS-REALITY (Xray), Shadowsocks and WireGuard, set up on both ends with one command, from a release or from your own build.
+- **Lab tests.** `wirelab lab test scenario.toml` runs recipes × versions × censors × paths, a fresh lab per cell, with workloads (bulk transfers checked by sha256, web page, steady stream, messenger, idle, probes), outages, a slow site, a server memory limit, and A/B comparison of versions.
+- **Censor.** `wl-censor` routes the lab and applies a preset. *Russia (TSPU)*, as of 2026-10, has SNI blocking, QUIC SNI blocking, the foreign-datacentre freeze, encapsulated-TLS and TLS-rate heuristics, UDP DNS spoofing and more, and every rule cites its source. Behaviour the sources leave open is a hypothesis you switch. Protocols are recognised by [nDPI](https://github.com/ntop/nDPI). The same censor judges any pcap or pcapng.
+- **CRTS outcomes.** Lab runs can write [CRTS](https://github.com/ospab/crts) conformance tables: amplification, length mode and periodicity measured from the captures.
+- **Simulator.** `wirelab run` puts both ends of a sans-io protocol in one process over a seeded link model.
 
-- Rust (stable) and Go 1.26 or newer.
-- Docker Engine on Linux, or inside WSL2 on Windows. On Windows the lab
-  talks to the `Debian` distro by default; set `WIRELAB_WSL_DISTRO` for
-  another one.
-- For the OSTP simulator adapter, a checkout of `ostp` next to this one
-  (`../ostp`).
+## Quick start
 
-## Run a lab
+You need Docker (on Windows inside WSL2), Rust and git; see [Getting started](docs/en/getting-started.md).
 
-```
+```bash
+git clone https://github.com/ospab/wirelab && cd wirelab
 cargo build --release
-cd wirelab-censor && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o ../containers/wire/bin/wl-censor . && cd ..
-./target/release/wirelab lab up
-./target/release/wirelab lab panel
+./target/release/wirelab doctor                 # checks the machine, says how to fix what is missing
+./target/release/wirelab censor build           # the censor, with nDPI, built in Docker
+./target/release/wirelab lab up --recipe ostp --set transport=tls
+./target/release/wirelab lab panel              # open the printed link
 ```
 
-`lab up` prints the addresses: the server is `10.77.2.3` and listens on 443
-unless you pass `--port`; the client reaches it at that address. Each node's
-`lab/<id>/<node>/` folder is `/lab` inside the container, and a
-`/lab/setup.sh` there runs every time the node starts, so a lab can be torn
-down and rebuilt without redoing the setup by hand.
+Or let it test on its own:
 
-`lab panel` prints a link with a token made for this run. Open it, pick
-**Russia (TSPU)** under Censor, apply, and start your server and client in
-the two consoles. Every censor decision appears in the panel with the rule
-that made it and its source, and is logged to the session folder together
-with the capture and both consoles.
-
-## Judge a capture
-
-```
-cd wirelab-censor && go build -o ../target/wl-censor . && cd ..
-./target/wl-censor -replay session.pcap -preset containers/censor/presets/ru-tspu.json \
-    -client-net 192.168.1.0/24 -server-net 203.0.113.7/32
+```bash
+./target/release/wirelab lab test scenarios/lab/recipes.toml
 ```
 
-The report lists, per rule, the flows it would have blocked and at which
-packet. Rules written for the lab's addresses are mapped onto the networks
-you pass.
+## Documentation
 
-## Adding to a preset
+| | |
+|---|---|
+| [Getting started](docs/en/getting-started.md) | install, build, first lab, first test run |
+| [Lab](docs/en/lab.md) | addresses, folders, the panel, session archives |
+| [Recipes](docs/en/recipes.md) | protocols set up on both ends, writing your own |
+| [Lab tests](docs/en/lab-tests.md) | scenario reference, workloads, reports, A/B |
+| [Censor](docs/en/censor.md) | rules, presets, hypotheses, sources |
+| [CRTS](docs/en/crts.md) | conformance outcomes from lab runs |
+| [Simulator](docs/en/simulator.md) | both ends in one process |
 
-Presets live in `containers/censor/presets/`. A rule without a `source` is
-rejected when the preset loads. If the sources do not settle how the censor
-behaves, add a hypothesis instead of picking one answer silently.
+## What it is not
+
+A lab is not a censored network. A PASS under a preset means "passes this model of the censor", and the model is only as good as the published observations it is built from: lists of blocked names and addresses are examples, and some thresholds are the preset's own choice (it says which). Field results come from field tests; the presets are meant to be checked against them and corrected.
 
 ## Layout
 
 | Path | What |
 |---|---|
 | `wirelab-cli/` | the `wirelab` command |
-| `wirelab-lab/` | lab orchestration and the panel |
-| `wirelab-censor/` | the censor (Go): router mode and `-replay` |
-| `wirelab-wire/`, `wirelab-sim/`, `wirelab-core/`, `wirelab-ostp/` | the simulator |
-| `containers/` | node, wire and censor files mounted into the lab |
-| `docs/` | roadmap and reports |
+| `wirelab-lab/` | lab, panel, recipes, lab tests, CRTS export, doctor |
+| `wirelab-censor/` | the censor (Go): router, rules, nDPI binding, `-replay` |
+| `wirelab-wire/` | capture parsing, analysis, pcapng |
+| `wirelab-sim/`, `wirelab-core/`, `wirelab-ostp/` | the simulator and its OSTP adapter |
+| `containers/` | node, wire and censor-build files; censor presets |
+| `recipes/`, `scenarios/` | protocol recipes; lab test and simulator scenarios |
+| `docs/` | documentation, roadmap, reports |
 
 ## License
 
-GNU Affero General Public License v3.0 only. See [LICENSE](LICENSE).
+GNU Affero General Public License v3.0 only, see [LICENSE](LICENSE). Third-party components and their licences: [NOTICE.md](NOTICE.md).

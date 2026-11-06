@@ -1,0 +1,36 @@
+name = "recipes"
+about = "Every recipe once, without and with the Russia (TSPU) censor preset: does it come up, move data intact, and what does the censor make of it."
+blob_mb = 20
+censor = ["off", "ru-tspu.json"]
+
+[[recipe]]
+use = "ostp"
+label = "ostp-udp"
+set = { transport = "udp" }
+
+[[recipe]]
+use = "ostp"
+label = "ostp-tls"
+set = { transport = "tls" }
+
+[[recipe]]
+use = "xray-reality"
+
+[[recipe]]
+use = "shadowsocks"
+
+[[recipe]]
+use = "wireguard"
+
+[[workload]]
+kind = "down"
+max_s = 120
+
+[[workload]]
+kind = "up"
+bytes_mb = 5
+max_s = 120
+
+[[workload]]
+kind = "web"
+rounds = 1

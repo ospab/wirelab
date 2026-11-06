@@ -71,6 +71,12 @@ select { font: 13px var(--sans); color: var(--text); background: var(--field); b
 #censor-log .hit { border-left-color: var(--alarm); }
 #censor-log .hit .what { color: var(--alarm); }
 #censor-log .meta { color: var(--muted); }
+.chart { width: 100%; height: 150px; display: block; margin-top: 6px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font: 12px var(--mono); color: var(--muted); margin-top: 4px; }
+.legend .rtt { color: var(--text); } .legend .hit { color: var(--alarm); }
+.check { display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--muted); margin-top: 6px; }
+a.button { font: 500 13px var(--sans); color: var(--text); border: 1px solid var(--rule); border-radius: 2px; padding: 3px 10px; text-decoration: none; }
+a.button:hover { border-color: var(--text); }
 #feed { font: 12px/1.5 var(--mono); font-variant-numeric: tabular-nums; }
 #feed .p { display: grid; grid-template-columns: 52px 64px 34px 40px 40px 1fr; gap: 6px; padding-left: 6px; border-left: 2px solid transparent; white-space: nowrap; }
 #feed .p.c2s { border-left-color: var(--c2s); } #feed .p.s2c { border-left-color: var(--s2c); }
@@ -106,6 +112,7 @@ select { font: 13px var(--sans); color: var(--text); background: var(--field); b
     <section>
       <div class="meta" id="lab-meta"></div>
       <div class="meta" id="capture-state"></div>
+      <div style="margin-top:6px"><a class="button" id="export" download>Download session archive</a></div>
     </section>
     <section>
       <h3>Wire</h3>
@@ -115,6 +122,13 @@ select { font: 13px var(--sans); color: var(--text); background: var(--field); b
         <span class="s2c">s→c</span><span id="s2c-p">0</span><span id="s2c-b">0</span>
       </div>
       <p class="hint">Captured on the client side: c→s as the client sent it, s→c after impairments.</p>
+      <canvas class="chart" id="chart" role="img" aria-label="Throughput each way and round-trip time over the last five minutes"></canvas>
+      <div class="legend">
+        <span class="c2s">— c→s Mbit/s</span><span class="s2c">— s→c Mbit/s</span>
+        <span class="rtt">· RTT ms (right axis)</span><span class="hit">| censor decision</span>
+      </div>
+      <label class="check"><input type="checkbox" id="ping"> ping the server every second (RTT for UDP; adds ICMP to the wire)</label>
+      <p class="hint">RTT without ping is read passively from TCP: a client segment, then the server's ACK for it.</p>
     </section>
     <section id="censor">
       <h3>Censor</h3>
@@ -397,6 +411,69 @@ function addCensorEvents(events) {
   while (log.childElementCount > 150) log.lastElementChild.remove();
 }
 
+// Charts: the last five minutes, one point per second of capture time.
+const series = new Map();
+const hits = [];
+function addSeries(points) { for (const p of points) series.set(p.t, p); }
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+function drawChart() {
+  const cv = $("chart"), dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (!w) return;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d");
+  g.scale(dpr, dpr);
+  g.clearRect(0, 0, w, h);
+  const keys = [...series.keys()].sort((a, b) => a - b);
+  const end = keys.length ? keys[keys.length - 1] : Math.floor(Date.now() / 1000);
+  const start = end - 299;
+  const pts = keys.filter(t => t >= start).map(t => series.get(t));
+  const padL = 34, padR = 34, padT = 6, padB = 16;
+  const iw = w - padL - padR, ih = h - padT - padB;
+  const x = t => padL + (t - start) / 299 * iw;
+  const mbit = b => b * 8 / 1e6;
+  const maxRate = Math.max(0.1, ...pts.map(p => Math.max(mbit(p.c2s), mbit(p.s2c))));
+  const rtts = pts.flatMap(p => [p.tcp_rtt, p.ping].filter(v => v != null));
+  const maxRtt = Math.max(1, ...rtts);
+  g.font = "11px " + css("--mono");
+  g.fillStyle = css("--muted");
+  g.strokeStyle = css("--rule");
+  g.lineWidth = 1;
+  g.beginPath(); g.moveTo(padL, padT + ih + 0.5); g.lineTo(padL + iw, padT + ih + 0.5); g.stroke();
+  g.textAlign = "right"; g.fillText(maxRate.toFixed(maxRate < 10 ? 1 : 0), padL - 4, padT + 9); g.fillText("0", padL - 4, padT + ih);
+  g.textAlign = "left"; if (rtts.length) g.fillText(maxRtt.toFixed(0) + " ms", padL + iw + 4, padT + 9);
+  g.textAlign = "center"; g.fillText("−5 min", padL + 18, h - 3); g.fillText("now", padL + iw - 10, h - 3);
+  // Censor decisions first, under the lines.
+  g.strokeStyle = css("--alarm");
+  for (const e of hits) {
+    const t = e.t / 1000;
+    if (t < start || t > end + 1) continue;
+    g.beginPath(); g.moveTo(x(t) + 0.5, padT); g.lineTo(x(t) + 0.5, padT + ih); g.stroke();
+  }
+  for (const [dir, color] of [["c2s", css("--c2s")], ["s2c", css("--s2c")]]) {
+    g.strokeStyle = color; g.lineWidth = 1.5; g.beginPath();
+    pts.forEach((p, i) => { const px = x(p.t), py = padT + ih - mbit(p[dir]) / maxRate * ih; i ? g.lineTo(px, py) : g.moveTo(px, py); });
+    g.stroke();
+  }
+  g.fillStyle = css("--text");
+  for (const p of pts) for (const v of [p.tcp_rtt, p.ping]) if (v != null) {
+    g.beginPath(); g.arc(x(p.t), padT + ih - v / maxRtt * ih, 1.6, 0, 7); g.fill();
+  }
+  const last = pts.filter(p => p.t < end).slice(-1)[0];
+  if (last) $("chart").setAttribute("aria-label", `Last second: c→s ${mbit(last.c2s).toFixed(2)} Mbit/s, s→c ${mbit(last.s2c).toFixed(2)} Mbit/s` + (last.tcp_rtt != null ? `, RTT ${last.tcp_rtt.toFixed(1)} ms` : ""));
+}
+function noteHits(events) {
+  for (const e of events) if (!["start", "preset", "expired", "error"].includes(e.action)) hits.push(e);
+  while (hits.length > 500) hits.shift();
+}
+setInterval(drawChart, 1000);
+window.addEventListener("resize", drawChart);
+$("ping").onchange = async e => {
+  try { await api("/api/ping", { on: e.target.checked }); }
+  catch (err) { e.target.checked = false; $("capture-state").textContent = "ping: " + err.message; }
+};
+$("export").href = `/api/export?t=${token}`;
+
 // Packet feed.
 const feed = $("feed");
 let paused = false;
@@ -437,9 +514,12 @@ function wireStream() {
       $("needles").value = m.needles.map(n => `${n.label} = ${n.text}`).join("\n");
       $("censor-log").innerHTML = "";
       addCensorEvents(m.censor || []);
+      series.clear(); hits.length = 0;
+      addSeries(m.series || []); noteHits(m.censor || []); drawChart();
     } else {
       addRows(m.rows.slice().reverse(), m.dropped_rows);
-      if (m.censor && m.censor.length) addCensorEvents(m.censor);
+      if (m.censor && m.censor.length) { addCensorEvents(m.censor); noteHits(m.censor); }
+      addSeries(m.series || []);
       for (const r of m.rows.filter(r => r.alarm)) { const d = document.createElement("div"); d.textContent = r.note; $("alarms").prepend(d); }
     }
   };

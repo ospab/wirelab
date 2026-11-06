@@ -6,7 +6,8 @@
 
 use crate::docker::Docker;
 use crate::lab::{self, LabInfo};
-use anyhow::{bail, Context, Result};
+use crate::wirectl::{self, PathReq, Wire};
+use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -23,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
+use wirelab_wire::analyze::{TcpRtt, Way};
 use wirelab_wire::byte_entropy;
 use wirelab_wire::capture::{find_all, icmp_quoted_target, parse_client_hello, PcapStream, Transport};
 
@@ -37,12 +39,12 @@ struct Panel {
     docker: Docker,
     token: String,
     origins: [String; 2],
-    /// Egress interfaces in the wire container: towards the server (carries
-    /// c2s) and towards the client (carries s2c).
-    if_to_server: String,
-    if_to_client: String,
+    ctl: Wire,
     wire: Mutex<WireState>,
     events: broadcast::Sender<String>,
+    /// The ping from client to server, while it is on.
+    ping: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    root: std::path::PathBuf,
 }
 
 #[derive(Default, Clone, Copy, Serialize)]
@@ -86,6 +88,44 @@ struct WireState {
     capture: String,
     censor_recent: VecDeque<serde_json::Value>,
     censor_pending: Vec<serde_json::Value>,
+    /// One point per second of capture time, for the charts.
+    series: VecDeque<SecPoint>,
+    rtt: TcpRtt,
+}
+
+/// One second on the charts: IP bytes each way and the RTT samples taken
+/// in it (passive TCP from the capture, and ping when it is on).
+#[derive(Clone, Default, Serialize)]
+struct SecPoint {
+    /// Unix seconds, capture clock.
+    t: u64,
+    c2s: u64,
+    s2c: u64,
+    /// Median of the TCP samples in this second, ms.
+    tcp_rtt: Option<f64>,
+    #[serde(skip)]
+    tcp_samples: Vec<f64>,
+    ping: Option<f64>,
+}
+
+const SERIES_SECONDS: usize = 300;
+
+impl WireState {
+    fn point(&mut self, t: u64) -> &mut SecPoint {
+        if self.series.back().map_or(true, |p| p.t < t) {
+            // Seconds without packets are zeros, not gaps.
+            let mut next = self.series.back().map_or(t, |p| p.t + 1).max(t.saturating_sub(SERIES_SECONDS as u64));
+            while next <= t {
+                self.series.push_back(SecPoint { t: next, ..Default::default() });
+                next += 1;
+            }
+            while self.series.len() > SERIES_SECONDS {
+                self.series.pop_front();
+            }
+        }
+        let i = self.series.iter().rposition(|p| p.t == t).unwrap_or(self.series.len() - 1);
+        &mut self.series[i]
+    }
 }
 
 fn now_ms() -> u128 {
@@ -95,11 +135,7 @@ fn now_ms() -> u128 {
 pub async fn serve(root: std::path::PathBuf, id: String, port: u16) -> Result<()> {
     let info = lab::load(&root, &id)?;
     let docker = Docker::detect();
-    let ifaces = docker
-        .run(&["exec", &info.wire, "cat", "/tmp/ifaces"])
-        .with_context(|| format!("reading the wire's interfaces; is lab {id:?} running?"))?;
-    let mut it = ifaces.split_whitespace();
-    let (Some(if_c), Some(if_s)) = (it.next(), it.next()) else { bail!("unexpected /tmp/ifaces in the wire: {ifaces:?}") };
+    let ctl = Wire::open(&docker, &info)?;
 
     let mut raw = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut raw);
@@ -107,14 +143,15 @@ pub async fn serve(root: std::path::PathBuf, id: String, port: u16) -> Result<()
     let (events, _) = broadcast::channel(64);
     let panel = Arc::new(Panel {
         origins: [format!("http://127.0.0.1:{port}"), format!("http://localhost:{port}")],
-        if_to_server: if_s.to_string(),
-        if_to_client: if_c.to_string(),
+        ctl,
         presets: root.join("containers/censor/presets"),
         info,
         docker,
         token,
         wire: Mutex::new(WireState { capture: "starting".into(), ..Default::default() }),
         events,
+        ping: Mutex::new(None),
+        root: root.clone(),
     });
 
     tokio::spawn(capture(panel.clone()));
@@ -130,6 +167,8 @@ pub async fn serve(root: std::path::PathBuf, id: String, port: u16) -> Result<()
         .route("/api/netem", post(api_netem))
         .route("/api/needles", post(api_needles))
         .route("/api/censor", get(api_censor_get).post(api_censor_set))
+        .route("/api/ping", post(api_ping))
+        .route("/api/export", get(api_export))
         .route("/ws/wire", get(ws_wire))
         .route("/ws/term/:zone", get(ws_term))
         .with_state(panel.clone());
@@ -161,16 +200,6 @@ impl Panel {
             let _ = writeln!(f, "{} {line}", now_ms());
         }
     }
-
-    fn qdisc(&self) -> HashMap<&'static str, String> {
-        let show = |dev: &str| {
-            self.docker
-                .run(&["exec", &self.info.wire, "tc", "qdisc", "show", "dev", dev])
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|e| format!("error: {e}"))
-        };
-        HashMap::from([("c2s", show(&self.if_to_server)), ("s2c", show(&self.if_to_client))])
-    }
 }
 
 fn deny() -> Response {
@@ -189,7 +218,7 @@ async fn api_lab(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<String, St
         return deny();
     }
     let p2 = p.clone();
-    let qdisc = tokio::task::spawn_blocking(move || p2.qdisc()).await.unwrap_or_default();
+    let qdisc = tokio::task::spawn_blocking(move || p2.ctl.qdisc()).await.unwrap_or_default();
     Json(serde_json::json!({
         "id": p.info.id,
         "base": p.info.base,
@@ -245,129 +274,24 @@ async fn api_status(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<String,
     Json(status).into_response()
 }
 
-/// One direction of netem.
-struct NetemReq {
-    delay_ms: f64,
-    jitter_ms: f64,
-    loss_pct: f64,
-    duplicate_pct: f64,
-    corrupt_pct: f64,
-    rate_kbit: f64,
-}
-
-fn netem_args(r: &NetemReq) -> Result<Vec<String>> {
-    for (name, v, max) in [
-        ("delay_ms", r.delay_ms, 60_000.0),
-        ("jitter_ms", r.jitter_ms, 60_000.0),
-        ("loss_pct", r.loss_pct, 100.0),
-        ("duplicate_pct", r.duplicate_pct, 100.0),
-        ("corrupt_pct", r.corrupt_pct, 100.0),
-        ("rate_kbit", r.rate_kbit, 100_000_000.0),
-    ] {
-        if !(v.is_finite() && (0.0..=max).contains(&v)) {
-            bail!("{name} = {v}: must be between 0 and {max}");
-        }
-    }
-    if r.jitter_ms > 0.0 && r.delay_ms == 0.0 {
-        bail!("jitter needs a delay to vary around");
-    }
-    let mut a = Vec::new();
-    if r.delay_ms > 0.0 {
-        a.extend(["delay".into(), format!("{}ms", r.delay_ms)]);
-        if r.jitter_ms > 0.0 {
-            a.push(format!("{}ms", r.jitter_ms));
-        }
-    }
-    for (k, v) in [("loss", r.loss_pct), ("duplicate", r.duplicate_pct), ("corrupt", r.corrupt_pct)] {
-        if v > 0.0 {
-            a.extend([k.to_string(), format!("{v}%")]);
-        }
-    }
-    if r.rate_kbit > 0.0 {
-        a.extend(["rate".into(), format!("{}kbit", r.rate_kbit)]);
-    }
-    Ok(a)
-}
-
-/// Impairments for the whole path, as a person thinks of them: the delay a
-/// ping would show (round trip) rather than per-direction one-way values.
-#[derive(Deserialize)]
-struct PathReq {
-    #[serde(default)]
-    rtt_ms: f64,
-    #[serde(default)]
-    rtt_jitter_ms: f64,
-    #[serde(default)]
-    loss_pct: f64,
-    #[serde(default)]
-    duplicate_pct: f64,
-    #[serde(default)]
-    corrupt_pct: f64,
-    #[serde(default)]
-    rate_kbit: f64,
-}
-
-impl PathReq {
-    /// One direction's netem: delay and jitter split evenly between the two
-    /// directions; loss, duplication, corruption and rate apply in each.
-    fn one_way(&self) -> NetemReq {
-        NetemReq {
-            delay_ms: self.rtt_ms / 2.0,
-            jitter_ms: self.rtt_jitter_ms / 2.0,
-            loss_pct: self.loss_pct,
-            duplicate_pct: self.duplicate_pct,
-            corrupt_pct: self.corrupt_pct,
-            rate_kbit: self.rate_kbit,
-        }
-    }
-}
-
 async fn api_netem(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<String, String>>, h: HeaderMap, Json(r): Json<PathReq>) -> Response {
     if !p.authorized(&q, &h) {
         return deny();
     }
-    let mut plan = Vec::new();
-    for (dir, dev) in [("c2s", p.if_to_server.clone()), ("s2c", p.if_to_client.clone())] {
-        match netem_args(&r.one_way()) {
-            Ok(args) => plan.push((dir, dev, args)),
-            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-        }
+    if let Err(e) = wirectl::netem_args(&r.one_way()) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
     let p2 = p.clone();
     let result = tokio::task::spawn_blocking(move || {
-        for (dir, dev, args) in plan {
-            let mut cmd: Vec<String> = vec!["exec".into(), p2.info.wire.clone(), "tc".into(), "qdisc".into()];
-            let clearing = args.is_empty();
-            if clearing {
-                cmd.extend(["del".into(), "dev".into(), dev.clone(), "root".into()]);
-            } else {
-                cmd.extend(["replace".into(), "dev".into(), dev.clone(), "root".into(), "netem".into()]);
-                cmd.extend(args);
-            }
-            let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-            let shown = cmd[2..].join(" ");
-            let res = match p2.docker.run(&refs) {
-                // Deleting a qdisc that is not there is the state we wanted anyway.
-                Err(e) if clearing && e.to_string().contains("No such file") => Ok(String::new()),
-                other => other,
-            };
-            p2.session_append("wire-changes.log", &format!("{dir}: {shown} -> {}", match &res {
-                Ok(_) => "ok".to_string(),
-                Err(e) => format!("error: {e}"),
-            }));
-            // Stop at the first failure: the response then shows the qdiscs
-            // as they really are, half-applied or not.
-            if let Err(e) = res {
-                return Err(e);
-            }
-        }
-        Ok(p2.qdisc())
+        p2.ctl.apply(&r, |line| p2.session_append("wire-changes.log", line))?;
+        Ok::<_, anyhow::Error>(p2.ctl.qdisc())
     })
     .await;
     match result {
         Ok(Ok(qdisc)) => Json(serde_json::json!({ "qdisc": qdisc })).into_response(),
         Ok(Err(e)) => {
-            let qdisc = p.qdisc();
+            // Stopped at the first failure: show the qdiscs as they really are.
+            let qdisc = p.ctl.qdisc();
             (StatusCode::BAD_GATEWAY, Json(serde_json::json!({ "error": e.to_string(), "qdisc": qdisc }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -401,7 +325,7 @@ async fn capture(p: Arc<Panel>) {
     let set = |s: String| p.wire.lock().unwrap().capture = s;
     let mut child = match p
         .docker
-        .tokio_command(&["exec", &p.info.wire, "tcpdump", "-i", &p.if_to_client, "-U", "-s", "0", "-B", "65536", "-w", "-", "net 10.77.0.0/16"])
+        .tokio_command(&["exec", &p.info.wire, "tcpdump", "-i", &p.ctl.if_to_client, "-U", "-s", "0", "-B", "65536", "-w", "-", "net 10.77.0.0/16"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -457,10 +381,23 @@ fn observe(w: &mut WireState, pkt: wirelab_wire::capture::Packet) {
     };
     let first = *w.first_us.get_or_insert(pkt.t_us);
     w.seen += 1;
+    let way = if idx == 0 { Way::C2s } else { Way::S2c };
+    let sample = w.rtt.push(way, &pkt);
+    let pt = w.point(pkt.t_us / 1_000_000);
+    match way {
+        Way::C2s => pt.c2s += pkt.ip_len as u64,
+        Way::S2c => pt.s2c += pkt.ip_len as u64,
+    }
+    if let Some(us) = sample {
+        pt.tcp_samples.push(us as f64 / 1000.0);
+        let mut v = pt.tcp_samples.clone();
+        v.sort_by(|a, b| a.total_cmp(b));
+        pt.tcp_rtt = Some(v[v.len() / 2]);
+    }
     let c = &mut w.counts[idx];
     c.packets += 1;
     c.ip_bytes += pkt.ip_len as u64;
-    c.payload_bytes += pkt.payload.len() as u64;
+    c.payload_bytes += pkt.payload_len as u64;
 
     let mut note = None;
     if let Transport::Icmp(ty, code) = pkt.transport {
@@ -505,7 +442,7 @@ fn observe(w: &mut WireState, pkt: wirelab_wire::capture::Packet) {
         sport: pkt.sport,
         dport: pkt.dport,
         len: pkt.ip_len,
-        payload: pkt.payload.len(),
+        payload: pkt.payload_len,
         // Below ~32 bytes the estimate says more about the sample size than
         // about the data.
         entropy: (pkt.payload.len() >= 32).then(|| (byte_entropy(&pkt.payload) * 100.0).round() / 100.0),
@@ -532,16 +469,16 @@ async fn ticker(p: Arc<Panel>) {
             let rows = std::mem::take(&mut w.pending);
             let dropped = std::mem::take(&mut w.dropped_rows);
             let censor = std::mem::take(&mut w.censor_pending);
+            // The last few seconds: earlier ones do not change any more.
+            let series: Vec<&SecPoint> = w.series.iter().rev().take(5).collect();
             serde_json::json!({
                 "type": "tick", "counts": w.counts, "rows": rows, "dropped_rows": dropped,
-                "capture": w.capture, "alarms": w.alarms.len(), "censor": censor,
+                "capture": w.capture, "alarms": w.alarms.len(), "censor": censor, "series": series,
             })
         };
         let _ = p.events.send(msg.to_string());
     }
 }
-
-const ACTIVE_PRESET: &str = "censor-preset.json";
 
 /// Follows the censor's decision log in the session folder. The censor
 /// writes it from inside the wire container through the bind mount.
@@ -597,7 +534,7 @@ async fn api_censor_get(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<Str
     if !p.authorized(&q, &h) {
         return deny();
     }
-    let active = std::fs::read(p.info.session.join(ACTIVE_PRESET)).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let active = std::fs::read(p.info.session.join(wirectl::ACTIVE_PRESET)).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
     Json(serde_json::json!({
         "available": p.info.censor,
         "presets": read_presets(&p.presets),
@@ -625,54 +562,19 @@ async fn api_censor_set(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<Str
     if !p.info.censor {
         return (StatusCode::CONFLICT, "this lab was started without the censor; build wl-censor, then lab down and lab up").into_response();
     }
-    let target = p.info.session.join(ACTIVE_PRESET);
     let Some(file) = r.file else {
-        let _ = std::fs::remove_file(&target);
+        let _ = wirectl::activate_preset(&p.info.session, None);
         p.session_append("wire-changes.log", "censor: off");
         return Json(serde_json::json!({ "active": null })).into_response();
     };
-    if file.contains(['/', '\\']) || !file.ends_with(".json") {
-        return (StatusCode::BAD_REQUEST, "preset must be a file name from containers/censor/presets").into_response();
-    }
-    let mut preset: serde_json::Value = match std::fs::read(p.presets.join(&file)).map_err(|e| e.to_string()).and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string())) {
+    let (preset, note) = match wirectl::build_preset(&p.presets, &file, &r.disabled, &r.hypotheses) {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("{file}: {e}")).into_response(),
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     };
-    if let Some(rules) = preset["rules"].as_array_mut() {
-        for rule in rules {
-            let id = rule["id"].as_str().unwrap_or_default().to_string();
-            rule["disabled"] = serde_json::Value::Bool(r.disabled.contains(&id));
-        }
-    }
-    let mut chosen_note = Vec::new();
-    let hyps = preset["hypotheses"].as_array().cloned().unwrap_or_default();
-    for (i, h) in hyps.iter().enumerate() {
-        let id = h["id"].as_str().unwrap_or_default().to_string();
-        let value = r.hypotheses.get(&id).copied().unwrap_or(h["default"].as_bool().unwrap_or(false));
-        let field = h["field"].as_str().unwrap_or_default().to_string();
-        let targets: Vec<String> = h["rules"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
-        if let Some(rules) = preset["rules"].as_array_mut() {
-            for rule in rules.iter_mut().filter(|rule| targets.iter().any(|t| rule["id"] == t.as_str())) {
-                rule[field.as_str()] = serde_json::Value::Bool(value);
-            }
-        }
-        preset["hypotheses"][i]["chosen"] = serde_json::Value::Bool(value);
-        chosen_note.push(format!("{id}={value}"));
-    }
-    // Written whole and renamed, so the censor never reads half a file.
-    let tmp = p.info.session.join("censor-preset.json.tmp");
-    let write = std::fs::write(&tmp, serde_json::to_vec_pretty(&preset).unwrap()).and_then(|_| std::fs::rename(&tmp, &target));
-    if let Err(e) = write {
+    if let Err(e) = wirectl::activate_preset(&p.info.session, Some(&preset)) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
-    p.session_append(
-        "wire-changes.log",
-        &format!(
-            "censor: {file}, rules off: {}, hypotheses: {}",
-            if r.disabled.is_empty() { "none".into() } else { r.disabled.join(",") },
-            if chosen_note.is_empty() { "none".into() } else { chosen_note.join(",") }
-        ),
-    );
+    p.session_append("wire-changes.log", &note);
     Json(serde_json::json!({ "active": preset })).into_response()
 }
 
@@ -686,7 +588,7 @@ async fn ws_wire(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<String, St
             serde_json::json!({
                 "type": "snapshot", "counts": w.counts, "rows": w.recent, "capture": w.capture,
                 "alarms": w.alarms, "needles": w.needles.iter().map(|(n, _)| n).collect::<Vec<_>>(),
-                "censor": w.censor_recent,
+                "censor": w.censor_recent, "series": w.series,
             })
         };
         if socket.send(Message::Text(snapshot.to_string())).await.is_err() {
@@ -799,31 +701,87 @@ async fn term_session(p: Arc<Panel>, zone: String, container: String, cols: u16,
     p.session_append(&format!("{zone}-console.log"), "--- console closed");
 }
 
+#[derive(Deserialize)]
+struct PingReq {
+    on: bool,
+}
+
+/// RTT for any protocol, UDP included: ping from the client to the server
+/// once a second. Its ICMP shows up on the wire, so it is off by default.
+async fn api_ping(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<String, String>>, h: HeaderMap, Json(r): Json<PingReq>) -> Response {
+    if !p.authorized(&q, &h) {
+        return deny();
+    }
+    {
+        let mut slot = p.ping.lock().unwrap();
+        if let Some(t) = slot.take() {
+            t.abort();
+        }
+        if r.on {
+            *slot = Some(tokio::spawn(ping_loop(p.clone())));
+        }
+    }
+    p.session_append("wire-changes.log", if r.on { "ping client -> server: on" } else { "ping client -> server: off" });
+    Json(serde_json::json!({ "on": r.on })).into_response()
+}
+
+async fn ping_loop(p: Arc<Panel>) {
+    use tokio::io::AsyncBufReadExt;
+    let child = p
+        .docker
+        .tokio_command(&["exec", &p.info.client, "ping", "-n", "-i", "1", lab::SERVER_IP])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn();
+    let Ok(mut child) = child else { return };
+    let mut out = tokio::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    while out.read_line(&mut line).await.map(|n| n > 0).unwrap_or(false) {
+        // "64 bytes from 10.77.2.3: seq=3 ttl=63 time=35.412 ms"
+        if let Some(ms) = line.split("time=").nth(1).and_then(|r| r.split_whitespace().next()).and_then(|v| v.parse::<f64>().ok()) {
+            let t = (now_ms() / 1000) as u64;
+            let mut w = p.wire.lock().unwrap();
+            w.point(t).ping = Some(ms);
+        }
+        line.clear();
+    }
+    drop(child);
+}
+
+/// The session as a .tar.gz download (see `wirelab lab export`).
+async fn api_export(State(p): State<Arc<Panel>>, Query(q): Query<HashMap<String, String>>, h: HeaderMap) -> Response {
+    if !p.authorized(&q, &h) {
+        return deny();
+    }
+    let p2 = p.clone();
+    let built = tokio::task::spawn_blocking(move || {
+        let name = format!("{}-{}.tar.gz", p2.info.id, p2.info.started_unix);
+        let out = p2.root.join("lab").join(&p2.info.id).join("exports").join(&name);
+        crate::export::archive_session(&p2.info.dir, &p2.info.session, &out).map(|_| (name, out))
+    })
+    .await;
+    match built {
+        Ok(Ok((name, out))) => match tokio::fs::read(&out).await {
+            Ok(bytes) => (
+                [
+                    (axum::http::header::CONTENT_TYPE, "application/gzip".to_string()),
+                    (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
+                ],
+                bytes,
+            )
+                .into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        },
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn netem_line_names_only_what_is_set() {
-        let r = NetemReq { delay_ms: 40.0, jitter_ms: 0.0, loss_pct: 1.5, duplicate_pct: 0.0, corrupt_pct: 0.0, rate_kbit: 10000.0 };
-        assert_eq!(netem_args(&r).unwrap().join(" "), "delay 40ms loss 1.5% rate 10000kbit");
-        let empty = NetemReq { delay_ms: 0.0, loss_pct: 0.0, rate_kbit: 0.0, ..r };
-        assert!(netem_args(&empty).unwrap().is_empty());
-    }
-
-    #[test]
-    fn round_trip_delay_is_split_between_directions() {
-        let path = PathReq { rtt_ms: 80.0, rtt_jitter_ms: 10.0, loss_pct: 1.0, duplicate_pct: 0.0, corrupt_pct: 0.0, rate_kbit: 0.0 };
-        assert_eq!(netem_args(&path.one_way()).unwrap().join(" "), "delay 40ms 5ms loss 1%");
-    }
-
-    #[test]
-    fn netem_rejects_nonsense() {
-        let r = NetemReq { delay_ms: 0.0, jitter_ms: 5.0, loss_pct: 0.0, duplicate_pct: 0.0, corrupt_pct: 0.0, rate_kbit: 0.0 };
-        assert!(netem_args(&r).is_err());
-        let r = NetemReq { jitter_ms: 0.0, loss_pct: 150.0, ..r };
-        assert!(netem_args(&r).is_err());
-    }
 
     #[test]
     fn uuid_needle_matches_raw_bytes_too() {

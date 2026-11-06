@@ -14,9 +14,10 @@ wirelab-wire = { path = "wirelab-wire" }
 wirelab-sim = { path = "wirelab-sim" }
 wirelab-ostp = { path = "wirelab-ostp" }
 wirelab-lab = { path = "wirelab-lab" }
-# The OSTP adapter drives the real protocol core from the sibling checkout:
-# a reimplementation would only test itself.
-ostp-core = { path = "../ostp/ostp-core" }
+# The OSTP adapter drives the real protocol core: a reimplementation would
+# only test itself. To build against a local checkout instead, add to
+# .cargo/config.toml:  [patch."https://github.com/ospab/ostp"] ostp-core = { path = "../ostp/ostp-core" }
+ostp-core = { git = "https://github.com/ospab/ostp", tag = "v0.4.7-beta.14" }
 
 anyhow = "1.0"
 bytes = "1.6"

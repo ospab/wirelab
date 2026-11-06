@@ -1,0 +1,8 @@
+name = "wireguard"
+about = "WireGuard (kernel module, wg from Alpine packages); routed: the client reaches the target through wg0, no proxy"
+base = "alpine"
+
+[params]
+# Seconds; 0 turns keepalives off (WireGuard's default).
+keepalive = "0"
+mtu = "1420"

@@ -25,7 +25,76 @@ pub struct Packet {
     pub dport: u16,
     /// IPv4 total length: what the packet occupied on the link minus framing.
     pub ip_len: usize,
+    /// Transport payload length as the IP header states it; `payload` can be
+    /// shorter when the capture cut the frame (tcpdump -s).
+    pub payload_len: usize,
     pub payload: Vec<u8>,
+    pub tcp: Option<TcpMeta>,
+}
+
+/// The TCP header fields the wire zone reasons about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpMeta {
+    pub seq: u32,
+    pub ack: u32,
+    pub flags: u8,
+}
+
+impl TcpMeta {
+    pub const FIN: u8 = 0x01;
+    pub const SYN: u8 = 0x02;
+    pub const RST: u8 = 0x04;
+    pub const ACK: u8 = 0x10;
+}
+
+/// One record of a classic pcap file, undissected.
+#[derive(Debug, Clone)]
+pub struct RawRecord {
+    pub t_us: u64,
+    /// Length of the frame on the wire; `frame` may be shorter (snaplen).
+    pub orig_len: u32,
+    pub frame: Vec<u8>,
+}
+
+/// The records of a classic pcap file with its link type, for rewriting it
+/// (as pcapng) without losing anything the dissector skips.
+pub fn read_pcap_records(bytes: &[u8]) -> Result<(u32, Vec<RawRecord>)> {
+    if bytes.len() < 24 {
+        bail!("pcap shorter than its global header");
+    }
+    let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let (le, nanos) = match magic {
+        0xa1b2_c3d4 => (true, false),
+        0xa1b2_3c4d => (true, true),
+        0xd4c3_b2a1 => (false, false),
+        0x4d3c_b2a1 => (false, true),
+        m => bail!("not a classic pcap file (magic {m:#010x})"),
+    };
+    let u32_at = |off: usize| -> u32 {
+        let b: [u8; 4] = bytes[off..off + 4].try_into().unwrap();
+        if le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) }
+    };
+    let linktype = u32_at(20) & 0x0fff_ffff;
+    let mut out = Vec::new();
+    let mut off = 24;
+    while off + 16 <= bytes.len() {
+        let sec = u32_at(off) as u64;
+        let frac = u32_at(off + 4) as u64;
+        let caplen = u32_at(off + 8) as usize;
+        let orig_len = u32_at(off + 12);
+        off += 16;
+        // A capture stopped mid-write ends in a partial record: keep what is whole.
+        let Some(frame) = bytes.get(off..off + caplen) else { break };
+        off += caplen;
+        let t_us = sec * 1_000_000 + if nanos { frac / 1000 } else { frac };
+        out.push(RawRecord { t_us, orig_len, frame: frame.to_vec() });
+    }
+    Ok((linktype, out))
+}
+
+/// Dissect one raw record the way `read_pcap` does.
+pub fn parse_record(linktype: u32, r: &RawRecord) -> Result<Option<Packet>> {
+    parse_frame(linktype, &r.frame, r.t_us)
 }
 
 const LINKTYPE_ETHERNET: u32 = 1;
@@ -153,16 +222,22 @@ fn parse_ipv4(ip: &[u8], t_us: u64) -> Option<Packet> {
     let dst = Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]);
     // Trust the IP length over the frame: Ethernet pads short frames.
     let l4 = ip.get(ihl..ip_len.min(ip.len()))?;
-    let (transport, sport, dport, payload) = match ip[9] {
+    let l4_len = ip_len.saturating_sub(ihl);
+    let mut tcp = None;
+    let (transport, sport, dport, hdr, payload) = match ip[9] {
         6 => {
             let doff = (*l4.get(12)? >> 4) as usize * 4;
-            (Transport::Tcp, u16::from_be_bytes([l4[0], l4[1]]), u16::from_be_bytes([l4[2], l4[3]]), l4.get(doff..)?)
+            let be32 = |o: usize| Some(u32::from_be_bytes(l4.get(o..o + 4)?.try_into().ok()?));
+            tcp = Some(TcpMeta { seq: be32(4)?, ack: be32(8)?, flags: *l4.get(13)? });
+            let payload = l4.get(doff..).unwrap_or(&[]);
+            (Transport::Tcp, u16::from_be_bytes([l4[0], l4[1]]), u16::from_be_bytes([l4[2], l4[3]]), doff, payload)
         }
-        1 => (Transport::Icmp(*l4.first()?, *l4.get(1)?), 0, 0, l4.get(8..)?),
-        17 => (Transport::Udp, u16::from_be_bytes([*l4.first()?, *l4.get(1)?]), u16::from_be_bytes([*l4.get(2)?, *l4.get(3)?]), l4.get(8..)?),
+        1 => (Transport::Icmp(*l4.first()?, *l4.get(1)?), 0, 0, 8, l4.get(8..)?),
+        17 => (Transport::Udp, u16::from_be_bytes([*l4.first()?, *l4.get(1)?]), u16::from_be_bytes([*l4.get(2)?, *l4.get(3)?]), 8, l4.get(8..)?),
         _ => return None,
     };
-    Some(Packet { t_us, src, dst, transport, sport, dport, ip_len, payload: payload.to_vec() })
+    let payload_len = l4_len.saturating_sub(hdr);
+    Some(Packet { t_us, src, dst, transport, sport, dport, ip_len, payload_len, payload: payload.to_vec(), tcp })
 }
 
 /// An ICMP destination-unreachable quotes the packet it refers to. Returns

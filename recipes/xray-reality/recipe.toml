@@ -1,0 +1,21 @@
+name = "xray-reality"
+about = "VLESS + XTLS-Vision over REALITY (Xray-core); the borrowed TLS site is a local nginx on the server"
+base = "alpine"
+proxy = "socks5h://127.0.0.1:1080"
+server_process = "xray"
+client_process = "xray"
+version_param = "version"
+
+[params]
+version = "v26.3.27"
+src = "https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-64.zip"
+# The name REALITY presents; the server's local TLS site answers for it.
+sni = "www.lab"
+id = "@random-hex-16"
+short_id = "@random-hex-8"
+flow = "xtls-rprx-vision"
+fingerprint = "chrome"
+
+[[fetch]]
+url = "${src}"
+save_as = "xray.zip"

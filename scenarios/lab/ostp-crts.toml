@@ -1,0 +1,54 @@
+# What a lab can measure of CRTS (conformance catalogue 0.1) for OSTP:
+# CT-005 amplification, CT-006 length mode under representative workloads,
+# CT-007 periodicity when idle and under low load. Every other CT-### comes
+# out NO DATA, with the reason. Output: crts.md and crts.json in the run folder.
+#
+# CRTS leaves the thresholds to the profile under test; the ones below are
+# placeholders to argue about, and without one the outcome is NO DATA.
+
+name = "ostp-crts"
+about = "CRTS lab measurements for OSTP over UDP and TLS: amplification, length mode, periodicity."
+blob_mb = 20
+
+[[recipe]]
+use = "ostp"
+label = "udp"
+set = { transport = "udp" }
+
+[[recipe]]
+use = "ostp"
+label = "tls"
+set = { transport = "tls" }
+
+# Representative workloads (CT-006): bulk, web, streaming, interactive.
+[[workload]]
+kind = "down"
+label = "bulk"
+
+[[workload]]
+kind = "web"
+rounds = 3
+
+[[workload]]
+kind = "stream"
+rate_kbit = 4000
+seconds = 30
+
+[[workload]]
+kind = "chat"
+count = 40
+interval_s = 1.5
+
+# Idle (CT-007): only the tunnel's own control traffic.
+[[workload]]
+kind = "idle"
+seconds = 120
+
+# Unauthenticated probes (CT-005).
+[[workload]]
+kind = "unauth"
+
+[crts]
+ct005 = true
+ct006 = { max_mode_share = 0.5 }
+ct007 = { max_peak = 0.5 }

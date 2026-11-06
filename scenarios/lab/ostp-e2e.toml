@@ -1,0 +1,84 @@
+# OSTP end to end, on this machine instead of CI runners:
+#
+#   1. UDP and TLS: connect, download and upload 100 MB, sha256 on both ends;
+#   2. speed on a 300 Mbit/s, 35 ms RTT, 0.01% loss path, against a threshold;
+#   3. the path cut for 5 s and for 30 s in the middle of a download: the
+#      connection recovers and the data arrives intact;
+#   4. a large upload to a slow site: the server's memory stays bounded.
+#
+#   wirelab lab test scenarios/lab/ostp-e2e.toml
+#
+# The thresholds below (min_mbps, max_server_rss_mb) are this file's choice,
+# not OSTP's: change them to what the release must meet.
+
+name = "ostp-e2e"
+about = "OSTP release check: integrity both ways on UDP and TLS, speed on a fast path, recovery after outages, server memory under a slow site."
+blob_mb = 100
+# A release from github.com/ospab/ostp; put a local Linux build in src to test that instead.
+
+[[recipe]]
+use = "ostp"
+label = "udp"
+set = { transport = "udp", version = "v0.4.7-beta.14" }
+
+[[recipe]]
+use = "ostp"
+label = "tls"
+set = { transport = "tls", version = "v0.4.7-beta.14" }
+
+[[path]]
+label = "clean"
+
+[[path]]
+label = "300M-35ms"
+rate_kbit = 300000
+rtt_ms = 35
+loss_pct = 0.01
+
+# 1. Integrity both ways.
+[[workload]]
+kind = "down"
+label = "down-100M"
+paths = ["clean"]
+max_s = 900
+
+[[workload]]
+kind = "up"
+label = "up-100M"
+paths = ["clean"]
+bytes_mb = 100
+max_s = 900
+
+# 2. Speed against a threshold.
+[[workload]]
+kind = "down"
+label = "speed"
+paths = ["300M-35ms"]
+min_mbps = 100
+max_s = 900
+
+# 3. Outages in the middle of a download (OSTP's client starts reconnecting
+#    after 25 s of silence).
+[[workload]]
+kind = "down"
+label = "cut-5s"
+paths = ["clean"]
+outage = [{ at_s = 3, for_s = 5 }]
+max_s = 900
+
+[[workload]]
+kind = "down"
+label = "cut-30s"
+paths = ["clean"]
+outage = [{ at_s = 3, for_s = 30 }]
+max_s = 900
+
+# 4. A slow site behind the server: the server must not hold the upload in memory.
+[[workload]]
+kind = "up"
+label = "slow-site"
+paths = ["clean"]
+bytes_mb = 100
+target_rate_kbit = 8000
+max_server_rss_mb = 200
+max_s = 900

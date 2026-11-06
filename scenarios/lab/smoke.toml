@@ -1,0 +1,33 @@
+name = "smoke"
+about = "A quick check that a recipe comes up and moves data: one cell per recipe, a few seconds of each workload."
+blob_mb = 20
+
+[[recipe]]
+use = "ostp"
+label = "ostp-udp"
+set = { transport = "udp" }
+
+[[workload]]
+kind = "down"
+max_s = 120
+
+[[workload]]
+kind = "up"
+bytes_mb = 10
+max_s = 120
+
+[[workload]]
+kind = "web"
+rounds = 1
+
+[[workload]]
+kind = "chat"
+count = 5
+interval_s = 1
+
+[[workload]]
+kind = "unauth"
+
+[crts]
+ct005 = true
+ct006 = {}

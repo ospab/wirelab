@@ -1,0 +1,49 @@
+# Two OSTP versions side by side: the same cells under each, and the report
+# shows the second against the first (+ is better). To compare a local build,
+# give a variant src = "D:/path/to/ostp" (a Linux binary or the release
+# .tar.gz) instead of a version.
+
+name = "ostp-ab"
+about = "OSTP beta.13 against beta.14 on a clean and a lossy path, with and without the TSPU censor preset."
+blob_mb = 50
+censor = ["off", "ru-tspu.json"]
+
+[[recipe]]
+use = "ostp"
+label = "udp"
+set = { transport = "udp" }
+
+[[recipe]]
+use = "ostp"
+label = "tls"
+set = { transport = "tls" }
+
+[[variant]]
+label = "beta.13"
+set = { version = "v0.4.7-beta.13" }
+
+[[variant]]
+label = "beta.14"
+set = { version = "v0.4.7-beta.14" }
+
+[[path]]
+label = "clean"
+
+[[path]]
+label = "lossy"
+rtt_ms = 80
+rtt_jitter_ms = 10
+loss_pct = 1
+
+[[workload]]
+kind = "down"
+max_s = 600
+
+[[workload]]
+kind = "web"
+rounds = 2
+
+[[workload]]
+kind = "chat"
+count = 20
+interval_s = 1

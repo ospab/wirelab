@@ -24,15 +24,24 @@ serve() {
         head -c $((2000 + i * 700)) /dev/urandom > /srv/www/obj/$i
         i=$((i + 1))
     done
+    mkdir -p /srv/www/up /tmp/nginx-body
+    chmod 777 /srv/www/up /tmp/nginx-body
+    # /up/ takes uploads (PUT) and gives them back, so an upload's integrity
+    # is checked on the far side; DELETE clears them.
     cat > /tmp/nginx.conf <<CONF
-worker_processes 1;
+worker_processes 2;
 error_log /tmp/nginx-error.log warn;
 pid /tmp/nginx.pid;
 events {}
 http {
     access_log off;
     sendfile on;
-    server { listen $1; root /srv/www; }
+    client_body_temp_path /tmp/nginx-body;
+    server {
+        listen $1;
+        root /srv/www;
+        location /up/ { dav_methods PUT DELETE; create_full_put_path on; client_max_body_size 0; }
+    }
 }
 CONF
     nginx -c /tmp/nginx.conf

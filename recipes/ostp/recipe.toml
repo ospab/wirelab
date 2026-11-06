@@ -1,0 +1,29 @@
+name = "ostp"
+about = "OSTP over UDP, UoT or TLS, from a GitHub release (Linux musl build) or a local build"
+base = "alpine"
+# The client's local SOCKS5/HTTP proxy; socks5h so names resolve on the server.
+proxy = "socks5h://127.0.0.1:1088"
+server_process = "ostp"
+client_process = "ostp"
+version_param = "version"
+
+[params]
+# Release tag on github.com/ospab/ostp.
+version = "v0.4.7-beta.14"
+# udp | uot | tls (UoT inside TLS on the same port, self-signed certificate)
+transport = "udp"
+# What to run: the release archive, or a path to a local Linux build (the
+# bare binary or the same .tar.gz). Overrides version when set to a path.
+src = "https://github.com/ospab/ostp/releases/download/${version}/ostp-linux-amd64.tar.gz"
+key = "@random-hex-16"
+# TTL desync (UDP only): decoy datagrams with a lowered TTL ahead of the
+# handshake. off | on; ttl_desync_ttl is used when ttl_desync_auto is off.
+ttl_desync = "off"
+ttl_desync_auto = "on"
+ttl_desync_ttl = "1"
+ttl_desync_count = "2"
+log_level = "info"
+
+[[fetch]]
+url = "${src}"
+save_as = "ostp.pkg"

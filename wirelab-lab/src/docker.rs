@@ -1,5 +1,5 @@
 //! Reaching the Docker engine. On Windows it lives inside a WSL distro, so
-//! every call goes through `wsl -d <distro> -- docker ...` and host paths are
+//! every call goes through `wsl -d <distro> -e docker ...` and host paths are
 //! translated to the distro's `/mnt/<drive>/...` view.
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -19,11 +19,22 @@ impl Docker {
     }
 
     /// Program and leading arguments that run `tool` where docker lives.
+    /// `wsl -e` passes the arguments as they are; `wsl --` would hand them
+    /// to a shell, which splits on spaces and quotes.
     fn prefix(&self, tool: &str) -> (String, Vec<String>) {
         match &self.distro {
-            Some(d) => ("wsl".into(), vec!["-d".into(), d.clone(), "--".into(), tool.into()]),
+            Some(d) => ("wsl".into(), vec!["-d".into(), d.clone(), "-e".into(), tool.into()]),
             None => (tool.into(), Vec::new()),
         }
+    }
+
+    /// A command run where docker lives (the WSL distro, or here), with a
+    /// deadline. Returns stdout, or an error with stderr.
+    pub fn host_run(&self, tool: &str, args: &[&str], limit: std::time::Duration) -> Result<String> {
+        let (prog, pre) = self.prefix(tool);
+        let mut c = Command::new(prog);
+        c.args(pre).args(args);
+        run_with_deadline(c, &format!("{tool} {}", args.join(" ")), limit)
     }
 
     pub fn command(&self, args: &[&str]) -> Command {
@@ -65,6 +76,21 @@ impl Docker {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    /// Run with a deadline: past it the call is killed and reported as such.
+    /// Returns stdout; a non-zero exit becomes an error carrying stderr.
+    pub fn run_for(&self, args: &[&str], limit: std::time::Duration) -> Result<String> {
+        run_with_deadline(self.command(args), &format!("docker {}", args.join(" ")), limit)
+    }
+
+    /// Whether docker answers at all, with its server version.
+    pub fn version(&self) -> Result<String> {
+        Ok(self.run_for(&["version", "--format", "{{.Server.Version}}"], std::time::Duration::from_secs(30))?.trim().to_string())
+    }
+
+    pub fn distro(&self) -> Option<&str> {
+        self.distro.as_deref()
+    }
+
     /// Run with output passed through to our terminal (image builds).
     pub fn run_visible(&self, args: &[&str]) -> Result<()> {
         let status = self.command(args).status().with_context(|| format!("starting docker {}", args.join(" ")))?;
@@ -89,6 +115,52 @@ impl Docker {
             }
             _ => Err(anyhow!("{} is not on a drive WSL mounts under /mnt", abs.display())),
         }
+    }
+}
+
+/// Run with a deadline: past it the process is killed and that is the
+/// error. Returns stdout; a non-zero exit becomes an error carrying stderr.
+pub fn run_with_deadline(mut cmd: Command, shown: &str, limit: std::time::Duration) -> Result<String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("starting {shown}"))?;
+    // Drain both pipes on threads so a chatty command cannot block on a full pipe.
+    let mut so = child.stdout.take().unwrap();
+    let mut se = child.stderr.take().unwrap();
+    let t_out = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut so, &mut b);
+        b
+    });
+    let t_err = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut se, &mut b);
+        b
+    });
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break Some(st);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let out = t_out.join().unwrap_or_default();
+    let err = t_err.join().unwrap_or_default();
+    match status {
+        None => bail!("{shown} did not finish within {} s", limit.as_secs()),
+        Some(st) if !st.success() => {
+            let e = String::from_utf8_lossy(&err);
+            bail!("{shown} failed ({st}): {}", e.trim())
+        }
+        Some(_) => Ok(String::from_utf8_lossy(&out).into_owned()),
     }
 }
 
